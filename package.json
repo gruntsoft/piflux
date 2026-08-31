@@ -1,0 +1,42 @@
+{
+  "name": "@gruntsoft/piflux",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "A human-in-the-loop coding workflow for Pi Coding Agent: plan, implement, review, and ship across focused agent sessions.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gruntsoft/piflux.git"
+  },
+  "homepage": "https://github.com/gruntsoft/piflux#readme",
+  "bugs": "https://github.com/gruntsoft/piflux/issues",
+  "keywords": [
+    "pi-package"
+  ],
+  "license": "MIT",
+  "files": [
+    "extensions",
+    "workflow-templates",
+    "prompts",
+    "skills",
+    "docs"
+  ],
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "scripts": {
+    "test": "node --test \"test/*.test.ts\""
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/index.ts"
+    ],
+    "skills": [
+      "./skills"
+    ],
+    "prompts": [
+      "./prompts"
+    ],
+    "image": "https://raw.githubusercontent.com/gruntsoft/piflux/main/docs/basic-workflow.png"
+  }
+}
