@@ -1,5 +1,5 @@
 {
-  "name": "@gruntsoft/piflux",
+  "name": "@gsft/piflux",
   "version": "1.0.0",
   "type": "module",
   "description": "A human-in-the-loop coding workflow for Pi Coding Agent: plan, implement, review, and ship across focused agent sessions.",
@@ -13,6 +13,9 @@
     "pi-package"
   ],
   "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
   "files": [
     "extensions",
     "workflow-templates",
@@ -38,5 +41,9 @@
       "./prompts"
     ],
     "image": "https://raw.githubusercontent.com/gruntsoft/piflux/main/docs/basic-workflow.png"
+  },
+  "allowScripts": {
+    "@google/genai@1.52.0": true,
+    "protobufjs@7.6.5": true
   }
 }

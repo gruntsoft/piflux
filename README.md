@@ -91,6 +91,11 @@ Settings are stored in a single global file: `~/.pi/agent/piflux/settings.json`.
 
 ## Install
 
+### npm
+```bash
+pi install npm:@gsft/piflux
+```
+
 ### Git
 ```bash
 pi install git:github.com/gruntsoft/piflux
