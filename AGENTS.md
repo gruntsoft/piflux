@@ -11,17 +11,15 @@ This repository is a Pi package that encodes my personal coding agent workflow. 
 
 ## Structure
 
-- Repository root — the installable Pi package (prompts, skills, extensions)
+- Repository root — the installable Pi package (extensions)
 - `README.md` — usage and install docs (the human manual)
 - `docs/` — Assets for the README (workflow diagram)
 - `AGENTS.md` — This file. Instructions for Pi when working on this repo itself.
 - `.pi/` — Project-local Pi settings (auto-loads the repo root when working in this repo)
 - Workflow artifacts — written by the workflow templates (start, plan, code, and review files); stored outside the repo under `~/.pi/agent/piflux/workflows/--<encoded-cwd>--/<branch>/` (see `extensions/paths.ts`)
 - `workflow-templates/` — Prompt templates for the workflow step commands (`start`, `plan`, `code`, `review`, `icode`, `ireview`, `ship`). Each file = one `/templatename` command; the directory is intentionally not declared in `package.json` (no auto-discovery — the workflow extension expands the templates itself). `/done` and `/abandon` have no templates — they run as pure extension code (teardown and abort).
-- `prompts/` — Standard Pi mechanism for general-purpose prompt templates (frontmatter, command expansion); declared in `package.json` for auto-discovery.
-- `skills/` — Self-contained capability packs following the Agent Skills standard. Each is invoked via `/skill:name` or auto-loaded by the agent.
 - `extensions/` — TypeScript modules that hook into Pi's runtime (tools, commands, UI components, event hooks). `extensions/index.ts` is the package's extension entry point: the workflow orchestrator there registers the step commands, the lifecycle commands `/done` (teardown) and `/abandon` (abort), and the `/piflux` meta commands (`state`, `view`, `settings`); `extensions/view.ts` implements the read-only viewer behind `/piflux view`.
-- `test/` — Unit tests for the extension (run with `npm test`)
+- `test/` — Tests for the extension (run with `npm test`), in three parts: stub-based unit tests (`index.test.ts`, backed by the `pi-coding-agent-stub.ts`/`pi-tui-stub.ts` resolve-hook stubs), a real-harness smoke test (`real-harness.test.ts`) that imports the extension with **no** resolve hook so the bare `@earendil-works` specifiers resolve through `node_modules` and asserts the full command/event registration surface, and a version-parity test (`harness-parity.test.ts`) that fails when the installed package versions drift from `pi --version`. `npm install` is required before testing (the real-harness test fails loud without it), and the parity test needs `pi` on PATH (it skips otherwise).
 
 ## Git conventions
 
@@ -33,7 +31,7 @@ This repository is a Pi package that encodes my personal coding agent workflow. 
 
 ## When working on this repo
 
-- The package is already loaded via `.pi/settings.json`. Use `/reload` after making changes to prompts, skills, or extensions to pick them up live.
+- The package is already loaded via `.pi/settings.json`. Use `/reload` after making changes to extensions to pick them up live.
 
 ## Workflow
 
@@ -58,5 +56,4 @@ Artifacts and state live outside the repo at `~/.pi/agent/piflux/workflows/--<en
 ## Conventions
 
 - Keep prompt templates focused and single-purpose. Use frontmatter `description` for discoverability in autocomplete.
-- Skills follow the Agent Skills standard. Include setup instructions if they need dependencies.
 - Extensions should be self-contained single files unless they grow large enough to warrant a subdirectory with `index.ts`.

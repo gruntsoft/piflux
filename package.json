@@ -19,8 +19,6 @@
   "files": [
     "extensions",
     "workflow-templates",
-    "prompts",
-    "skills",
     "docs"
   ],
   "peerDependencies": {
@@ -34,16 +32,11 @@
     "extensions": [
       "./extensions/index.ts"
     ],
-    "skills": [
-      "./skills"
-    ],
-    "prompts": [
-      "./prompts"
-    ],
     "image": "https://raw.githubusercontent.com/gruntsoft/piflux/main/docs/basic-workflow.png"
   },
   "allowScripts": {
-    "@google/genai@1.52.0": true,
-    "protobufjs@7.6.5": true
+    "@google/genai@2.21.0": true,
+    "esbuild@0.28.2": true,
+    "protobufjs@7.6.6": true
   }
 }
