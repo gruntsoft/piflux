@@ -93,7 +93,7 @@ Settings are stored in a single global file: `~/.pi/agent/piflux/settings.json`.
 
 ### npm
 ```bash
-pi install npm:@gsft/piflux
+pi install npm:@gruntsoft/piflux
 ```
 
 ### Git

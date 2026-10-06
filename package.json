@@ -1,6 +1,6 @@
 {
-  "name": "@gsft/piflux",
-  "version": "1.0.0",
+  "name": "@gruntsoft/piflux",
+  "version": "1.0.1",
   "type": "module",
   "description": "A human-in-the-loop coding workflow for Pi Coding Agent: plan, implement, review, and ship across focused agent sessions.",
   "repository": {
