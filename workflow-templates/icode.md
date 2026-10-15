@@ -13,7 +13,7 @@ git branch --show-current
 
 Read the plan file at `$WORKFLOW_DIR/<branch>/plan.md`. If it doesn't exist, note this as a limitation and continue — the review findings are your primary driver.
 
-The plan file is **read-only**. Never modify it. If the plan is wrong, incomplete, or inconsistent with what you find, raise it with the user — they'll decide whether to proceed, adjust course, or return to planning.
+The plan file is **read-only**. Never modify it. If the plan is incomplete or inconsistent with what you find, raise it with the user — they'll decide whether to proceed, adjust course, or return to planning. The exception is a false premise already flagged as a review finding: those are worked through the normal findings path in Phase 2, escalating only when they invalidate the plan's intent.
 
 Read the review file at `$WORKFLOW_DIR/<branch>/review.md`. If it doesn't exist, stop: "No review file found for branch `<branch>`. Run `/review` first."
 
@@ -42,6 +42,7 @@ For each finding:
 - If a finding is wrong, already fixed, or not worth fixing, do not silently skip it: record it in the code file's Unresolved issues section with a clear explanation, and tell the user at the end. When the judgment is close, ask the user rather than deciding alone.
 - If a finding is unclear, ask the user for clarification before implementing.
 - If a finding flags an undocumented plan deviation, documenting it in the code file's Plan deviations section with a sound justification is a valid resolution — along with fixing the code when the finding calls for it.
+- If a finding alleges the plan rests on a false premise, weigh it on its merits — check the cited sources yourself. Plan conformance is not a defense: "I implemented it according to the plan" is not a valid reason to skip such a finding. Accepting it means fixing against ground truth and documenting the resulting deviation in Plan deviations; refusing it requires engaging with the ground truth it cites (showing the premise holds, or that the plan isn't actually contradicted). If the premise invalidates the plan's intent, escalate to the user.
 
 Write tests for your fixes: methods, conditional branches, error scenarios, edge cases. Tests should be meaningful, but you may skip scenarios that are unreasonable to test. If the project has no test infrastructure, skip test creation entirely — do not set up a new framework.
 

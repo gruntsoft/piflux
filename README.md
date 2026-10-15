@@ -39,9 +39,9 @@ Creates a new coding session for the workflow. The coding session reads the plan
 ### 4. `/review`
 
 Creates a new reviewing session for the workflow. The reviewing session takes as input the planning artifact, the coding report, and the code changes retrieved from `git` in order to review the code changes based on the following criteria:
-- Correctness: Whether the code does what it is supposed to do.
-- Suitability: How well the code fits the plan it is meant to implement.
-- Maintainability: Whether the code is well-structured for the codebase and easy to maintain.
+- Correctness: Whether the code is right; judged against language, platform, libraries, and the codebase itself.
+- Suitability: Whether the code follows the plan's intent; its requirements, design decisions, and the right level of abstraction.
+- Readability: Whether the code is well-structured for the codebase, consistent with its conventions, and easy to maintain.
 - Performance: Whether the code performs well. But, unless otherwise specified, performance should not take precedence over the first three criteria.
 - Test Coverage: Evaluates how well the code is tested if a test suite is available and if changes can be reasonably tested.
 
