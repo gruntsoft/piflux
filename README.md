@@ -63,11 +63,11 @@ Commits with a user-approved message, and squashes the code changes back to the 
 
 ### 8. `/done`
 
-Finishes the workflow by cleaning up workflow artifacts, workflow sessions, and the workflow branch. Can only be executed after `/ship`, and presumes that git state is the same as it was on the previous `/ship` call.
+Finishes the workflow by deleting the workflow branch, removing the workflow sessions, and archiving the workflow artifacts to `~/.pi/agent/piflux/history/<ENCODED_REPOSITORY>/done/<BRANCH_SLUG>/`. Can only be executed after `/ship`, and presumes that git state is the same as it was on the previous `/ship` call.
 
-### 9. `/abandon`
+### 9. `/abandon [reason]`
 
-Drops an unfinished workflow by restoring the git state to how it was prior to the workflow, and by removing the underlying artifacts and sessions that are used to manage it. Slightly more aggressive than `/done`, and can be used at any time during an active workflow to signal that the work should be thrown away.
+Drops an unfinished workflow by restoring the git state to how it was prior to the workflow, removing the workflow sessions, and archiving the workflow artifacts to `~/.pi/agent/piflux/history/<ENCODED_REPOSITORY>/abandoned/<BRANCH_SLUG>/`. More aggressive than `/done`, and can be used at any time during an active workflow to signal that the work should be thrown away. An optional free-text reason (_e.g._: `/abandon plan not covering legacy settings`) is recorded within the archive.
 
 ### Meta workflow commands
 

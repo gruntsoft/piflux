@@ -20,10 +20,10 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 register(new URL("./hooks.mjs", import.meta.url));
 
 const extensionModule = await import("../extensions/index.ts");
-const { substituteArgs, mergeStepSettings, serializeSettings, setStepInFile, unsetStepInFile, levelsForModel, parsePlanMetadata } = extensionModule;
+const { substituteArgs, mergeStepSettings, serializeSettings, setStepInFile, unsetStepInFile, levelsForModel, parsePlanMetadata, artifactsOutcomeLine, sessionsOutcomeLine } = extensionModule;
 
 const pathsModule = await import("../extensions/paths.ts");
-const { encodeSessionDirName, workflowRootFor } = pathsModule;
+const { encodeSessionDirName, historyRootFor, slugifyBranch, workflowRootFor } = pathsModule;
 
 const viewModule = await import("../extensions/view.ts");
 const { formatRelativeTime, buildSelectorItems, renderStateSummary, artifactPath, clampScrollTop, keyToScrollDelta, parseWheelEvent, scrollPercent, createWorkflowViewer, VIEW_TARGETS, isViewTarget, viewArgumentCompletions } = viewModule;
@@ -469,8 +469,10 @@ test("/piflux bare shows step, branch, and next commands; idle when no workflow"
 		await runCommand(h, "piflux", "state");
 		assert.ok(h.notifications.some((n) => n.msg.includes("start")), "/piflux state shows step");
 		assert.ok(
-			h.notifications.some((n) => n.msg.includes("Run /abandon to destroy the workflow, discard uncommitted changes, and return to the base branch.")),
-			"/piflux state hint reflects the git cleanup",
+			h.notifications.some((n) =>
+				n.msg.includes("Run /abandon to abandon the workflow (artifacts are archived, not destroyed), discard uncommitted changes, and return to the base branch."),
+			),
+			"/piflux state hint reflects the teardown",
 		);
 	} finally {
 		h.destroy();
@@ -650,7 +652,23 @@ test("/done from ship tears down git, sessions, artifacts, and state, landing in
 		assert.equal(h.sessionName(), "Clean slate", "lands in a fresh session");
 		assert.ok(!existsSync(h.stateFile), "state file deleted");
 		assert.ok(!existsSync(sessions.start), "session file deleted");
-		assert.ok(!existsSync(branchDir), "branch dir deleted");
+		assert.ok(!existsSync(branchDir), "branch dir moved out of workflows");
+
+		// The artifacts are archived, not destroyed: the whole branch dir
+		// (plan.md included) lands in the history tree with workflow.json.
+		const archiveDir = join(h.globalDir, "piflux", "history", encodeSessionDirName(h.projectDir), "done", "my-feature");
+		for (const step of ["start", "plan", "code", "review"]) {
+			assert.ok(existsSync(join(archiveDir, `${step}.md`)), `${step} artifact archived`);
+		}
+		const wf = JSON.parse(readFileSync(join(archiveDir, "workflow.json"), "utf-8"));
+		assert.equal(wf.outcome, "done");
+		assert.equal(wf.branch, "my-feature");
+		assert.equal(wf.baseBranch, "master");
+		assert.equal(wf.finalStep, "done");
+		assert.equal(wf.commit, git(h.projectDir, ["rev-parse", "HEAD"]), "commit records the base-branch HEAD");
+		assert.ok(!Number.isNaN(Date.parse(wf.archivedAt)), "archivedAt is an ISO timestamp");
+		assert.ok(!("reason" in wf), "no reason key on a /done archive");
+
 		assert.ok(existsSync(join(workflowRoot, "other-branch", "plan.md")), "other branch's artifact survives");
 		assert.ok(existsSync(join(workflowRoot, "other-branch")), "other branch's dir survives");
 		assert.ok(existsSync(join(h.projectDir, "sessions", "unrelated.jsonl")), "untracked session file survives");
@@ -674,7 +692,8 @@ test("/done from ship tears down git, sessions, artifacts, and state, landing in
 		assert.ok(summary.msg.includes("Current branch: master"), "current branch reported");
 		assert.ok(summary.msg.includes("Working tree: clean"), "tree state reported");
 		assert.ok(summary.msg.includes("Release tag: none"), "tag outcome reported");
-		assert.ok(summary.msg.includes("sessions and artifacts: removed"), "artifacts reported");
+		assert.ok(summary.msg.includes("Workflow sessions: deleted"), "session deletion reported");
+		assert.ok(summary.msg.includes(`Workflow artifacts: archived to ${archiveDir}`), "archive path reported");
 		assert.ok(summary.msg.includes("Session: Clean slate"), "clean slate reported");
 		assert.ok(h.notifications.some((n) => n.msg.includes("Workflow cleaned up")), "cleanup notification shown");
 	} finally {
@@ -964,6 +983,7 @@ test("/abandon from the feature branch discards the dirty tree, returns to base,
 		assert.ok(confirm.includes("discard all uncommitted changes on `my-feature`"), "confirm warns about the discard");
 		assert.ok(confirm.includes("switch to `master`"), "confirm names the base branch");
 		assert.ok(confirm.includes("delete `my-feature` locally and on origin"), "confirm names the branch deletion");
+		assert.ok(confirm.includes("archived (not destroyed)"), "confirm says artifacts are archived, not destroyed");
 
 		// No state-machine gate: mid-workflow abandon succeeded.
 		assert.ok(!errorNotifications(h).some((m) => m.includes("not valid")), "abandon not transition-blocked");
@@ -984,6 +1004,18 @@ test("/abandon from the feature branch discards the dirty tree, returns to base,
 		assert.ok(!existsSync(h.stateFile), "state file deleted");
 		assert.ok(!existsSync(sessions.start), "session file deleted");
 
+		// The artifacts are archived, not destroyed.
+		const archiveDir = join(h.globalDir, "piflux", "history", encodeSessionDirName(repo), "abandoned", "my-feature");
+		assert.ok(!existsSync(join(workflowRootFor(repo), "my-feature")), "branch dir moved out of workflows");
+		assert.ok(existsSync(join(archiveDir, "start.md")), "start artifact archived");
+		const wf = JSON.parse(readFileSync(join(archiveDir, "workflow.json"), "utf-8"));
+		assert.equal(wf.outcome, "abandoned");
+		assert.equal(wf.branch, "my-feature");
+		assert.equal(wf.baseBranch, "master");
+		assert.equal(wf.finalStep, "plan");
+		assert.equal(wf.commit, null, "no commit for an abandoned run");
+		assert.ok(!("reason" in wf), "no reason key on a bare abandon");
+
 		// Summary reports the outcomes.
 		const summary = h.notifications.find((n) => n.msg.includes("abandoned"));
 		assert.ok(summary, "summary notification shown");
@@ -991,7 +1023,8 @@ test("/abandon from the feature branch discards the dirty tree, returns to base,
 		assert.ok(summary.msg.includes("Local branch my-feature: deleted"), "local deletion reported");
 		assert.ok(summary.msg.includes("Current branch: master"), "current branch reported");
 		assert.ok(summary.msg.includes("Working tree: discarded"), "tree discard reported");
-		assert.ok(summary.msg.includes("sessions and artifacts: removed"), "artifacts reported");
+		assert.ok(summary.msg.includes("Workflow sessions: deleted"), "session deletion reported");
+		assert.ok(summary.msg.includes(`Workflow artifacts: archived to ${archiveDir}`), "archive path reported");
 		assert.ok(summary.msg.includes("Session: Clean slate"), "clean slate reported");
 		assert.ok(!summary.msg.includes("Git cleanup incomplete"), "no incomplete line on full success");
 		assert.ok(h.notifications.some((n) => n.msg.includes("Workflow cleaned up")), "cleanup notification shown");
@@ -1564,6 +1597,12 @@ test("/abandon --force with a valid state behaves like plain /abandon", async ()
 		assert.equal(h.sessionName(), "Clean slate", "lands in a fresh session");
 		assert.equal(git(repo, ["branch", "--show-current"]), "master", "git cleanup performed like plain abandon");
 		assert.throws(() => git(repo, ["show-ref", "--verify", "--quiet", "refs/heads/my-feature"]), "feature branch deleted like plain abandon");
+		// --force is dropped from the reason: the flag is a mode switch, not
+		// free text, so workflow.json carries no reason key.
+		const wf = JSON.parse(
+			readFileSync(join(h.globalDir, "piflux", "history", encodeSessionDirName(repo), "abandoned", "my-feature", "workflow.json"), "utf-8"),
+		);
+		assert.ok(!("reason" in wf), "--force token not recorded as the reason");
 	} finally {
 		if (bare) rmSync(bare, { recursive: true, force: true });
 		h.destroy();
@@ -2400,6 +2439,54 @@ test("workflowRootFor nests under getAgentDir()/piflux/workflows with the encode
 	}
 });
 
+test("historyRootFor nests under getAgentDir()/piflux/history with the encoded cwd", () => {
+	const h = createHarness();
+	try {
+		assert.equal(
+			historyRootFor(h.projectDir),
+			join(h.globalDir, "piflux", "history", encodeSessionDirName(h.projectDir)),
+		);
+		assert.equal(
+			historyRootFor(h.projectDir).replace("history", "workflows"),
+			workflowRootFor(h.projectDir),
+			"same encoded repo dir as the workflow root, different subtree",
+		);
+	} finally {
+		h.destroy();
+	}
+});
+
+test("artifactsOutcomeLine: the state-file failure leads the line even when the archive succeeded", () => {
+	assert.equal(
+		artifactsOutcomeLine({ stateFileRemoved: true, sessionsRemoved: true, archivePath: "/tmp/hist/done/b" }),
+		"archived to /tmp/hist/done/b",
+		"full success reports the archive path",
+	);
+	assert.equal(
+		artifactsOutcomeLine({ stateFileRemoved: true, sessionsRemoved: true, archivePath: null }),
+		"archive incomplete — see the warnings above",
+		"failed move with intact state gate reports the incomplete archive",
+	);
+	assert.equal(
+		artifactsOutcomeLine({ stateFileRemoved: false, sessionsRemoved: true, archivePath: "/tmp/hist/done/b" }),
+		"cleanup incomplete — see the warnings above; artifacts archived to /tmp/hist/done/b",
+		"surviving state file (the new-workflow gate) is never masked by a successful archive",
+	);
+	assert.equal(
+		artifactsOutcomeLine({ stateFileRemoved: false, sessionsRemoved: true, archivePath: null }),
+		"cleanup incomplete — see the warnings above",
+	);
+});
+
+test("sessionsOutcomeLine: only a clean sweep reports deleted", () => {
+	assert.equal(sessionsOutcomeLine({ stateFileRemoved: true, sessionsRemoved: true, archivePath: null }), "deleted");
+	assert.equal(
+		sessionsOutcomeLine({ stateFileRemoved: true, sessionsRemoved: false, archivePath: null }),
+		"incomplete — see the warnings above",
+		"a warned unlink must not claim a blanket deletion",
+	);
+});
+
 test("buildSelectorItems: state first, artifacts with relative mtime or missing", () => {
 	const h = createHarness();
 	try {
@@ -2509,8 +2596,9 @@ test("agent_settled is gone: /done tolerates a state file that cannot be deleted
 		// so a read-only workflow dir must not be written to during /done.
 		writeFileSync(h.stateFile, JSON.stringify({ step: "done", branch: "my-feature", sessions }));
 		// One artifact (start) is enough — the plan file must stay intact
-		// (the read-only dir only blocks deletion, not reads). The branch-dir
-		// delete fails the same way the per-artifact deletes used to.
+		// (the read-only dir only blocks deletion, not reads). The archive's
+		// rename out of the read-only dir fails the same way the old
+		// branch-dir delete used to.
 		const workflowRoot = workflowRootFor(h.projectDir);
 		mkdirSync(join(workflowRoot, "my-feature"), { recursive: true });
 		writeFileSync(join(workflowRoot, "my-feature", "start.md"), "# start\n");
@@ -2522,12 +2610,12 @@ test("agent_settled is gone: /done tolerates a state file that cannot be deleted
 			await runCommand(h, "done");
 			assert.ok(existsSync(h.stateFile), "state file survives the failed unlink");
 			assert.ok(h.notifications.some((n) => n.type === "warning"), "warnings shown for failed deletions");
-			assert.ok(h.notifications.some((n) => n.msg.includes("workflow directory")), "branch-dir removal failure reported, not swallowed");
+			assert.ok(h.notifications.some((n) => n.msg.includes("Could not archive")), "archive failure reported, not swallowed");
 			assert.ok(!h.notifications.some((n) => n.msg.includes("Workflow cleaned up")), "no success notification");
-			// The summary comes after the cleanup and must not claim removal.
+			// The summary comes after the cleanup and must not claim completion.
 			const summary = h.notifications.find((n) => n.msg.includes("torn down"));
 			assert.ok(summary, "summary still reported");
-			assert.ok(!summary.msg.includes("sessions and artifacts: removed"), "summary does not claim removal");
+			assert.ok(!summary.msg.includes("Workflow artifacts: archived to"), "summary does not claim an archive");
 			assert.ok(summary.msg.includes("cleanup incomplete"), "summary reports the incomplete cleanup");
 		} finally {
 			chmodSync(workflowRoot, 0o755);
@@ -2596,6 +2684,183 @@ test("a state file without a sessions field is rejected as corrupt", async () =>
 		h.notifications.length = 0;
 		await runCommand(h, "plan", "desc");
 		assert.ok(errorNotifications(h).some((m) => m.includes("no active workflow")), "blocked as idle, no TypeError");
+	} finally {
+		h.destroy();
+	}
+});
+
+test("slugifyBranch maps path-hostile characters and trims edge cases", () => {
+	assert.equal(slugifyBranch("my-feature"), "my-feature", "plain name unchanged");
+	assert.equal(slugifyBranch("feature/one"), "feature-one", "path separator mapped");
+	assert.equal(slugifyBranch("a\\b"), "a-b", "backslash mapped");
+	assert.equal(slugifyBranch("fix: thing"), "fix--thing", "colon and space mapped one-to-one");
+	assert.equal(slugifyBranch("bump-dependency-bar-to-v1.1"), "bump-dependency-bar-to-v1-1", "dots mapped, so .n collision suffixes stay unambiguous");
+	assert.equal(slugifyBranch("  spaced  "), "spaced", "whitespace mapped and trimmed");
+	assert.equal(slugifyBranch("-lead-"), "lead", "leading/trailing dashes trimmed");
+	assert.equal(slugifyBranch(".hidden"), "hidden", "leading dot trimmed");
+	assert.equal(slugifyBranch(".."), "branch", "dot-only name falls back");
+	assert.equal(slugifyBranch(".../..."), "branch", "path-trick name falls back");
+	assert.equal(slugifyBranch(""), "branch", "empty branch falls back");
+});
+
+test("/abandon records an optional free-text reason in workflow.json", async () => {
+	const h = createHarness();
+	try {
+		const repo = h.projectDir;
+		writeStartArtifactWithMetadata(repo, "my-feature", "master");
+		writeFileSync(h.stateFile, JSON.stringify({ step: "plan", branch: "my-feature", sessions: {} }));
+
+		h.setConfirmResult(true);
+		h.notifications.length = 0;
+		await runCommand(h, "abandon", "plan missed auth");
+
+		assert.ok(!existsSync(h.stateFile), "teardown completed");
+		const wf = JSON.parse(
+			readFileSync(join(h.globalDir, "piflux", "history", encodeSessionDirName(repo), "abandoned", "my-feature", "workflow.json"), "utf-8"),
+		);
+		assert.equal(wf.reason, "plan missed auth", "reason recorded verbatim (args minus flags)");
+	} finally {
+		h.destroy();
+	}
+});
+
+test("archiving the same branch twice appends the collision counter", async () => {
+	const h = createHarness();
+	try {
+		const repo = h.projectDir;
+		const abandon = async () => {
+			// Each abandon archives the branch dir away, so the next run
+			// re-creates it from scratch (mirrors a fresh /start on the same
+			// branch name).
+			writeStartArtifactWithMetadata(repo, "my-feature", "master");
+			writeFileSync(h.stateFile, JSON.stringify({ step: "plan", branch: "my-feature", sessions: {} }));
+			h.setConfirmResult(true);
+			h.notifications.length = 0;
+			await runCommand(h, "abandon");
+		};
+
+		await abandon();
+		await abandon();
+
+		const abandonedRoot = join(h.globalDir, "piflux", "history", encodeSessionDirName(repo), "abandoned");
+		assert.ok(existsSync(join(abandonedRoot, "my-feature", "workflow.json")), "first archive at <slug>");
+		assert.ok(existsSync(join(abandonedRoot, "my-feature.1", "workflow.json")), "second archive at <slug>.1");
+		assert.ok(!existsSync(join(abandonedRoot, "my-feature.2")), "no third archive");
+	} finally {
+		h.destroy();
+	}
+});
+
+test("teardown with an already-archived branch dir skips the archive and completes", async () => {
+	const h = createHarness();
+	try {
+		const repo = h.projectDir;
+		writeStartArtifactWithMetadata(repo, "my-feature", "master");
+		writeFileSync(h.stateFile, JSON.stringify({ step: "plan", branch: "my-feature", sessions: {} }));
+		// Simulate a previous run that archived the branch dir but died
+		// before removing the state file: the retry must skip the archive
+		// silently and finish the remaining cleanup.
+		rmSync(join(workflowRootFor(repo), "my-feature"), { recursive: true });
+
+		h.setConfirmResult(true);
+		h.notifications.length = 0;
+		await runCommand(h, "abandon");
+
+		assert.ok(!existsSync(h.stateFile), "state file removed on the retry");
+		assert.ok(
+			!h.notifications.some((n) => n.type === "warning" && n.msg.includes("Could not archive")),
+			"no archive warning on the retry",
+		);
+		assert.ok(
+			!existsSync(join(h.globalDir, "piflux", "history", encodeSessionDirName(repo))),
+			"nothing archived on the retry",
+		);
+	} finally {
+		h.destroy();
+	}
+});
+
+test("a failed archive warns and teardown continues (state file still removed)", async () => {
+	const h = createHarness();
+	try {
+		const repo = h.projectDir;
+		writeStartArtifactWithMetadata(repo, "my-feature", "master");
+		writeFileSync(h.stateFile, JSON.stringify({ step: "plan", branch: "my-feature", sessions: {} }));
+		// A read-only branch dir blocks the workflow.json write — the exact
+		// guardrail case: the archive must warn without aborting teardown.
+		const branchDir = join(workflowRootFor(repo), "my-feature");
+		chmodSync(branchDir, 0o555);
+
+		h.setConfirmResult(true);
+		h.notifications.length = 0;
+		await runCommand(h, "abandon");
+		try {
+			assert.ok(h.notifications.some((n) => n.type === "warning" && n.msg.includes("Could not archive")), "archive failure warned");
+			assert.ok(existsSync(join(branchDir, "start.md")), "artifacts remain in place");
+			assert.ok(!existsSync(h.stateFile), "state file still removed — teardown not blocked");
+			const summary = h.notifications.find((n) => n.msg.includes("abandoned"));
+			assert.ok(summary!.msg.includes("Workflow artifacts: archive incomplete"), "summary reports the incomplete archive");
+		} finally {
+			chmodSync(branchDir, 0o755);
+		}
+	} finally {
+		h.destroy();
+	}
+});
+
+test("/abandon --force with a valid state drops the flag but keeps the reason tokens", async () => {
+	const h = createHarness();
+	try {
+		const repo = h.projectDir;
+		writeStartArtifactWithMetadata(repo, "my-feature", "master");
+		writeFileSync(h.stateFile, JSON.stringify({ step: "plan", branch: "my-feature", sessions: {} }));
+
+		// --force is inert with a readable state (plain abandon), but the
+		// flag itself must never leak into the recorded reason.
+		h.setConfirmResult(true);
+		h.notifications.length = 0;
+		await runCommand(h, "abandon", "--force plan missed auth");
+
+		assert.ok(!existsSync(h.stateFile), "teardown completed");
+		const wf = JSON.parse(
+			readFileSync(join(h.globalDir, "piflux", "history", encodeSessionDirName(repo), "abandoned", "my-feature", "workflow.json"), "utf-8"),
+		);
+		assert.equal(wf.reason, "plan missed auth", "reason keeps the non-flag tokens in order");
+	} finally {
+		h.destroy();
+	}
+});
+
+test("a warned session deletion is reported per-line instead of a blanket deleted", async () => {
+	const h = createHarness();
+	try {
+		const repo = h.projectDir;
+		writeStartArtifactWithMetadata(repo, "my-feature", "master");
+		// The tracked session file sits in a read-only dir (deliberately NOT
+		// the harness's own sessions dir, which the fake session replacement
+		// writes to): the unlink warns, the file survives.
+		const readonlyDir = join(repo, "readonly-sessions");
+		mkdirSync(readonlyDir);
+		const sessionFile = join(readonlyDir, "start.jsonl");
+		writeFileSync(sessionFile, "");
+		chmodSync(readonlyDir, 0o555);
+		writeFileSync(h.stateFile, JSON.stringify({ step: "plan", branch: "my-feature", sessions: { start: sessionFile } }));
+
+		h.setConfirmResult(true);
+		h.notifications.length = 0;
+		await runCommand(h, "abandon");
+		try {
+			assert.ok(
+				h.notifications.some((n) => n.type === "warning" && n.msg.includes("Could not delete session file")),
+				"session failure warned",
+			);
+			const summary = h.notifications.find((n) => n.msg.includes("abandoned"));
+			assert.ok(summary!.msg.includes("Workflow sessions: incomplete — see the warnings above"), "sessions line reports the incomplete deletion");
+			assert.ok(!summary!.msg.includes("Workflow sessions: deleted"), "no blanket deleted claim");
+			assert.ok(!existsSync(h.stateFile), "state file still removed");
+		} finally {
+			chmodSync(readonlyDir, 0o755);
+		}
 	} finally {
 		h.destroy();
 	}
