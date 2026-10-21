@@ -36,7 +36,6 @@
   },
   "allowScripts": {
     "@google/genai@2.21.0": true,
-    "esbuild@0.28.2": true,
     "protobufjs@7.6.6": true
   }
 }
