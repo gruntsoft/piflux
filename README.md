@@ -83,6 +83,10 @@ Here the user can view the work in progress. Can be used while a step is current
 
 The viewer is read-only and in-app; there is no need to open workflow artifacts in external editors, and there is no chance of accidental edits that may affect implementation.
 
+### `/piflux history`
+
+Browse the archives of historical workflows (`/done` and `/abandon`), stored under `~/.pi/agent/piflux/history/<ENCODED_REPOSITORY>/`. Like `/piflux view`, it is read-only and in-app. It needs no active workflow, so it can be used mid-workflow or with none running. 
+
 ### `/piflux settings`
 
 Allows the user to pick which model and thinking level should be used for each step.

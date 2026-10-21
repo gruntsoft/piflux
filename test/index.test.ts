@@ -26,7 +26,10 @@ const pathsModule = await import("../extensions/paths.ts");
 const { encodeSessionDirName, historyRootFor, slugifyBranch, workflowRootFor } = pathsModule;
 
 const viewModule = await import("../extensions/view.ts");
-const { formatRelativeTime, buildSelectorItems, renderStateSummary, artifactPath, clampScrollTop, keyToScrollDelta, parseWheelEvent, scrollPercent, createWorkflowViewer, VIEW_TARGETS, isViewTarget, viewArgumentCompletions } = viewModule;
+const { formatRelativeTime, buildSelectorItems, renderStateSummary, artifactPath, clampScrollTop, keyToScrollDelta, parseWheelEvent, scrollPercent, createWorkflowViewer, VIEW_TARGETS, isViewTarget, viewArgumentCompletions, ARTIFACT_STEPS } = viewModule;
+
+const historyModule = await import("../extensions/history.ts");
+const { HISTORY_OUTCOMES, isHistoryOutcome, parseWorkflowMetadata, listArchiveEntries, formatLocalDate, buildOutcomeItems, buildArchiveItems, buildArtifactItems, renderWorkflowMetadata, historyArgumentCompletions, createHistoryViewer } = historyModule;
 
 // ---------------------------------------------------------------------------
 // Harness: fake pi + fake session contexts in a throwaway project directory
@@ -2317,6 +2320,363 @@ test("/piflux view plan and view state open the content screen directly", async 
 	}
 });
 
+// ---------------------------------------------------------------------------
+// /piflux history — archived-workflow viewer (history.ts)
+// ---------------------------------------------------------------------------
+
+/** Full-sha stand-in used across the history fixtures (short form: bbaa611). */
+const HISTORY_COMMIT = "bbaa6110123456789abcdef0123456789abcdef0";
+
+/** Shape of the workflow.json the archives carry (only archivedAt is required). */
+interface ArchiveMeta {
+	outcome?: string;
+	branch?: string | null;
+	baseBranch?: string | null;
+	finalStep?: string | null;
+	archivedAt: string;
+	commit?: string | null;
+	reason?: string;
+}
+
+/** Write one fake archive dir under the harness's history root. */
+function writeArchive(h: Harness, outcome: "done" | "abandoned", name: string, metadata: ArchiveMeta | null, artifacts: string[] = []): string {
+	const dir = join(historyRootFor(h.projectDir), outcome, name);
+	mkdirSync(dir, { recursive: true });
+	if (metadata) writeFileSync(join(dir, "workflow.json"), `${JSON.stringify(metadata, null, "\t")}\n`);
+	for (const artifact of artifacts) writeFileSync(join(dir, `${artifact}.md`), `# ${artifact}\n`);
+	return dir;
+}
+
+/**
+ * ISO (Z) timestamp for local noon on a Y-M-D, so the local-date rendering
+ * (`formatLocalDate`) yields that calendar date in any timezone — UTC-based
+ * literals like `2026-10-16T12:34:56.000Z` roll over a day at UTC±13/14.
+ * Only for tests that assert the rendered date string; ordering-only tests
+ * can keep Z literals.
+ */
+const localIso = (year: number, month: number, day: number): string => new Date(year, month - 1, day, 12).toISOString();
+
+test("HISTORY_OUTCOMES and isHistoryOutcome accept done/abandoned and reject everything else", () => {
+	assert.deepEqual([...HISTORY_OUTCOMES], ["done", "abandoned"], "outcome vocabulary");
+	assert.deepEqual([...ARTIFACT_STEPS], ["start", "plan", "code", "review"], "artifact vocabulary shared with view.ts");
+	for (const outcome of HISTORY_OUTCOMES) {
+		assert.equal(isHistoryOutcome(outcome), true, `${outcome} is a history outcome`);
+	}
+	for (const token of ["foo", "done ", "DONE", "abandon", "", "view", "done x"]) {
+		assert.equal(isHistoryOutcome(token), false, `${JSON.stringify(token)} is not a history outcome`);
+	}
+});
+
+test("parseWorkflowMetadata: valid fields, tolerant nulls, corrupt JSON, invalid archivedAt", () => {
+	const h = createHarness();
+	try {
+		const root = historyRootFor(h.projectDir);
+		const valid = writeArchive(h, "done", "ok", {
+			outcome: "done",
+			branch: "my-feature",
+			baseBranch: "main",
+			finalStep: "ship",
+			archivedAt: "2026-10-16T12:34:56.000Z",
+			commit: HISTORY_COMMIT,
+		});
+		const meta = parseWorkflowMetadata(join(valid, "workflow.json"));
+		assert.ok(meta);
+		assert.equal(meta.outcome, "done");
+		assert.equal(meta.branch, "my-feature");
+		assert.equal(meta.baseBranch, "main");
+		assert.equal(meta.finalStep, "ship");
+		assert.equal(meta.archivedAt, "2026-10-16T12:34:56.000Z");
+		assert.equal(meta.commit, HISTORY_COMMIT);
+		assert.equal(meta.reason, null, "no reason on a done archive");
+
+		// Null-valued fields (the abandoned-run schema) parse as null.
+		const nulls = writeArchive(h, "done", "nulls", {
+			outcome: "abandoned",
+			branch: "b",
+			baseBranch: null,
+			finalStep: "code",
+			archivedAt: "2026-01-02T03:04:05.000Z",
+			commit: null,
+			reason: "wip",
+		});
+		const meta2 = parseWorkflowMetadata(join(nulls, "workflow.json"));
+		assert.ok(meta2);
+		assert.equal(meta2.baseBranch, null);
+		assert.equal(meta2.commit, null);
+		assert.equal(meta2.reason, "wip");
+
+		// Missing file, corrupt JSON, non-object payload, invalid date → null.
+		assert.equal(parseWorkflowMetadata(join(root, "done", "missing", "workflow.json")), null, "missing file");
+		const corrupt = writeArchive(h, "done", "corrupt", null);
+		writeFileSync(join(corrupt, "workflow.json"), "{not json");
+		assert.equal(parseWorkflowMetadata(join(corrupt, "workflow.json")), null, "corrupt JSON");
+		const array = writeArchive(h, "done", "array", null);
+		writeFileSync(join(array, "workflow.json"), "[]");
+		assert.equal(parseWorkflowMetadata(join(array, "workflow.json")), null, "non-object payload");
+		const badDate = writeArchive(h, "done", "bad-date", { outcome: "done", branch: "b", archivedAt: "not-a-date" });
+		assert.equal(parseWorkflowMetadata(join(badDate, "workflow.json")), null, "invalid archivedAt");
+	} finally {
+		h.destroy();
+	}
+});
+
+test("listArchiveEntries: reverse-chron by archivedAt, .1 collisions, mtime fallback, stray files ignored", () => {
+	const h = createHarness();
+	try {
+		writeArchive(h, "done", "older", { outcome: "done", branch: "older", finalStep: "ship", archivedAt: "2025-01-01T00:00:00.000Z", commit: HISTORY_COMMIT });
+		writeArchive(h, "done", "newer", { outcome: "done", branch: "newer", finalStep: "code", archivedAt: "2026-10-16T00:00:00.000Z", commit: HISTORY_COMMIT });
+		// Same branch archived twice → .1 collision suffix, later date sorts first.
+		writeArchive(h, "done", "newer.1", { outcome: "done", branch: "newer", finalStep: "plan", archivedAt: "2026-10-17T00:00:00.000Z", commit: HISTORY_COMMIT });
+		// Metadata-less entry: sorted by dir mtime, set between older and newer.
+		const noMeta = writeArchive(h, "done", "no-meta", null);
+		const fallbackMs = Date.parse("2026-01-01T00:00:00.000Z");
+		utimesSync(noMeta, new Date(fallbackMs), new Date(fallbackMs));
+		// Stray non-dir files are not archives.
+		writeFileSync(join(historyRootFor(h.projectDir), "done", "stray.txt"), "x");
+
+		const entries = listArchiveEntries(historyRootFor(h.projectDir), "done");
+		assert.deepEqual(entries.map((e) => e.name), ["newer.1", "newer", "no-meta", "older"], "reverse-chron by archivedAt with mtime fallback");
+		assert.equal(entries[2]!.metadata, null, "metadata-less entry parses as null");
+		assert.equal(entries[2]!.sortKeyMs, fallbackMs, "mtime fallback is the sort key");
+
+		assert.deepEqual(listArchiveEntries(join(historyRootFor(h.projectDir), "missing-root"), "done"), [], "missing outcome root yields no entries");
+		assert.deepEqual(listArchiveEntries(historyRootFor(h.projectDir), "abandoned"), [], "empty outcome yields no entries");
+	} finally {
+		h.destroy();
+	}
+});
+
+test("formatLocalDate renders a local YYYY-MM-DD date", () => {
+	const ms = new Date(2026, 9, 16, 12, 34).getTime(); // local 2026-10-16
+	assert.equal(formatLocalDate(ms), "2026-10-16");
+});
+
+test("buildOutcomeItems: both outcomes always listed with counts", () => {
+	const h = createHarness();
+	try {
+		writeArchive(h, "done", "a", { outcome: "done", branch: "a", finalStep: "ship", archivedAt: "2026-10-16T00:00:00.000Z", commit: HISTORY_COMMIT });
+		writeArchive(h, "done", "b", { outcome: "done", branch: "b", finalStep: "ship", archivedAt: "2026-10-17T00:00:00.000Z", commit: HISTORY_COMMIT });
+		const items = buildOutcomeItems(historyRootFor(h.projectDir));
+		assert.deepEqual(items.map((i) => i.value), ["done", "abandoned"], "both outcomes listed even when one is empty");
+		assert.deepEqual(items.map((i) => i.description), ["2 archived", "0 archived"]);
+	} finally {
+		h.destroy();
+	}
+});
+
+test("buildArchiveItems: lean rows — branch label, date/step/commit description, (no metadata) marker", () => {
+	const h = createHarness();
+	try {
+		writeArchive(h, "done", "my-feature", { outcome: "done", branch: "my-feature", finalStep: "ship", archivedAt: localIso(2026, 10, 16), commit: HISTORY_COMMIT });
+		writeArchive(h, "abandoned", "wip", { outcome: "abandoned", branch: "wip", finalStep: "code", archivedAt: localIso(2026, 10, 15), commit: null, reason: "wrong direction" });
+		const noMeta = writeArchive(h, "done", "no-meta.1", null);
+		const fallbackMs = Date.parse(localIso(2026, 1, 1));
+		utimesSync(noMeta, new Date(fallbackMs), new Date(fallbackMs));
+
+		const doneItems = buildArchiveItems(listArchiveEntries(historyRootFor(h.projectDir), "done"));
+		assert.deepEqual(doneItems, [
+			{ value: "my-feature", label: "my-feature", description: "2026-10-16 · step: ship · bbaa611" },
+			{ value: "no-meta.1", label: "no-meta.1", description: "2026-01-01 · (no metadata)" },
+		], "done rows: branch label, absolute date, final step, short commit; slug + marker without metadata");
+
+		const abandonedItems = buildArchiveItems(listArchiveEntries(historyRootFor(h.projectDir), "abandoned"));
+		assert.deepEqual(abandonedItems.map((i) => i.value), ["wip"]);
+		assert.deepEqual(abandonedItems.map((i) => i.description), ["2026-10-15 · step: code"], "null commit drops the commit segment");
+	} finally {
+		h.destroy();
+	}
+});
+
+test("buildArtifactItems: existing steps only plus the workflow row, with per-artifact dates", () => {
+	const h = createHarness();
+	try {
+		const dir = writeArchive(
+			h,
+			"done",
+			"my-feature",
+			{ outcome: "done", branch: "my-feature", finalStep: "ship", archivedAt: localIso(2026, 10, 16), commit: HISTORY_COMMIT },
+			["start", "plan"],
+		);
+		const metadata = parseWorkflowMetadata(join(dir, "workflow.json"));
+
+		const items = buildArtifactItems({ dir, name: "my-feature", metadata, sortKeyMs: Date.parse(localIso(2026, 10, 16)) });
+		assert.deepEqual(items.map((i) => i.value), ["start", "plan", "workflow"], "only existing artifact steps, workflow row last");
+		assert.match(items[0]!.description, /^written \d{4}-\d{2}-\d{2}$/);
+		assert.match(items[1]!.description, /^written \d{4}-\d{2}-\d{2}$/);
+		assert.equal(items[2]!.description, "2026-10-16 · step: ship · bbaa611", "workflow row summarizes the metadata");
+
+		// A metadata-less archive still gets the workflow row.
+		const bare = buildArtifactItems({ dir, name: "my-feature", metadata: null, sortKeyMs: 0 });
+		assert.deepEqual(bare.map((i) => i.value), ["start", "plan", "workflow"]);
+		assert.equal(bare[2]!.description, "(no metadata)");
+	} finally {
+		h.destroy();
+	}
+});
+
+test("renderWorkflowMetadata: key-value card with reason when present, placeholder without metadata", () => {
+	const card = renderWorkflowMetadata({
+		outcome: "abandoned",
+		branch: "wip",
+		baseBranch: "main",
+		finalStep: "code",
+		archivedAt: "2026-10-15T08:00:00.000Z",
+		commit: null,
+		reason: "wrong direction",
+	});
+	assert.match(card, /- Outcome: \*\*abandoned\*\*/);
+	assert.match(card, /- Branch: \*\*wip\*\*/);
+	assert.match(card, /- Base branch: main/);
+	assert.match(card, /- Final step: \*\*code\*\*/);
+	assert.match(card, /- Archived: 2026-10-15T08:00:00\.000Z/);
+	assert.match(card, /- Commit: —/);
+	assert.match(card, /- Reason: wrong direction/, "abandon reason appears on the card");
+
+	const doneCard = renderWorkflowMetadata({
+		outcome: "done",
+		branch: "my-feature",
+		baseBranch: "main",
+		finalStep: "ship",
+		archivedAt: "2026-10-16T12:34:56.000Z",
+		commit: HISTORY_COMMIT,
+		reason: null,
+	});
+	assert.match(doneCard, new RegExp("- Commit: `" + HISTORY_COMMIT + "`"));
+	assert.doesNotMatch(doneCard, /Reason/, "no reason line on a done archive");
+
+	assert.match(renderWorkflowMetadata(null), /No workflow\.json metadata/, "graceful placeholder card");
+});
+
+test("historyArgumentCompletions: full-argument values, prefix filtering, null for non-history text", () => {
+	const h = createHarness();
+	try {
+		const cwd = h.projectDir;
+		// No history root at all: both outcomes suggested with zero counts.
+		assert.deepEqual(historyArgumentCompletions("history", cwd), [
+			{ value: "history done", label: "done", description: "0 archived" },
+			{ value: "history abandoned", label: "abandoned", description: "0 archived" },
+		], "values carry the full argument text");
+		assert.deepEqual(historyArgumentCompletions("history a", cwd)!.map((i) => i.value), ["history abandoned"], "prefix filter");
+
+		// Counts reflect the archive tree.
+		writeArchive(h, "done", "my-feature", { outcome: "done", branch: "my-feature", finalStep: "ship", archivedAt: "2026-10-16T00:00:00.000Z", commit: HISTORY_COMMIT });
+		assert.deepEqual(historyArgumentCompletions("history d", cwd)!.map((i) => i.description), ["1 archived"]);
+
+		// Non-history argument text → null (falls back to first-token completion).
+		assert.equal(historyArgumentCompletions("", cwd), null);
+		assert.equal(historyArgumentCompletions("view", cwd), null);
+		assert.equal(historyArgumentCompletions("historyx", cwd), null, "no space after history — not an argument invocation");
+	} finally {
+		h.destroy();
+	}
+});
+
+test("/piflux history in non-tui mode errors without opening the viewer", async () => {
+	const h = createHarness();
+	try {
+		writeArchive(h, "done", "my-feature", { outcome: "done", branch: "my-feature", finalStep: "ship", archivedAt: "2026-10-16T12:34:56.000Z", commit: HISTORY_COMMIT });
+		h.setMode("print");
+		await runCommand(h, "piflux", "history");
+		assert.ok(errorNotifications(h).some((m) => m.includes("TUI")), "error mentions the interactive TUI");
+		assert.equal(h.customCalls(), 0, "no viewer opened");
+
+		// The direct syntax hits the same mode guard.
+		h.notifications.length = 0;
+		await runCommand(h, "piflux", "history done");
+		assert.ok(errorNotifications(h).some((m) => m.includes("TUI")), "direct history also errors in non-tui mode");
+		assert.equal(h.customCalls(), 0, "no viewer opened");
+	} finally {
+		h.destroy();
+	}
+});
+
+test("/piflux history with no archives notifies and opens nothing, even mid-workflow", async () => {
+	const h = createHarness();
+	try {
+		// An active workflow must not be required: state file present, no history.
+		writeFileSync(h.stateFile, JSON.stringify({ step: "code", branch: "my-feature", sessions: {} }));
+		await runCommand(h, "piflux", "history");
+		assert.ok(h.notifications.some((n) => n.type === "info" && n.msg.includes("No archived workflows yet.")), "global empty-state notify");
+		assert.equal(h.customCalls(), 0, "no viewer opened");
+	} finally {
+		h.destroy();
+	}
+});
+
+test("/piflux history done with an empty done outcome notifies outcome-specifically, then offers the selector", async () => {
+	const h = createHarness();
+	try {
+		// abandoned has an entry, so the selector has rows to offer after the notify.
+		writeArchive(h, "abandoned", "wip", { outcome: "abandoned", branch: "wip", finalStep: "code", archivedAt: "2026-10-15T00:00:00.000Z", commit: null, reason: "wip" });
+		mkdirSync(join(historyRootFor(h.projectDir), "done"), { recursive: true });
+		await runCommand(h, "piflux", "history done");
+		assert.ok(
+			h.notifications.some((n) => n.type === "info" && n.msg.includes("No done workflows archived yet.")),
+			"outcome-specific empty-state notify",
+		);
+		assert.equal(h.customCalls(), 1, "outcome selector opened after the notify");
+	} finally {
+		h.destroy();
+	}
+
+	// With an entirely empty archive the outcome notify is followed by the
+	// global one, and nothing ever opens.
+	const empty = createHarness();
+	try {
+		await runCommand(empty, "piflux", "history done");
+		assert.ok(empty.notifications.some((n) => n.msg.includes("No done workflows archived yet.")));
+		assert.ok(empty.notifications.some((n) => n.msg.includes("No archived workflows yet.")));
+		assert.equal(empty.customCalls(), 0, "nothing opened");
+	} finally {
+		empty.destroy();
+	}
+});
+
+test("/piflux history with an invalid token or extra arguments shows usage", async () => {
+	const h = createHarness();
+	try {
+		await runCommand(h, "piflux", "history bogus");
+		assert.ok(h.notifications.some((n) => n.msg.includes("Usage: /piflux history [done|abandoned]")), "usage for a bogus outcome");
+		assert.equal(h.customCalls(), 0, "no viewer opened");
+
+		await runCommand(h, "piflux", "history done extra");
+		assert.ok(h.notifications.some((n) => n.msg.includes("Usage: /piflux history")), "usage for extra tokens");
+		assert.equal(h.customCalls(), 0, "no viewer opened");
+	} finally {
+		h.destroy();
+	}
+});
+
+test("/piflux history opens the outcome selector and writes nothing", async () => {
+	const h = createHarness();
+	try {
+		writeArchive(h, "done", "my-feature", { outcome: "done", branch: "my-feature", finalStep: "ship", archivedAt: "2026-10-16T12:34:56.000Z", commit: HISTORY_COMMIT }, ["plan"]);
+		const stateBefore = existsSync(h.stateFile) ? readFileSync(h.stateFile, "utf-8") : "";
+		await runCommand(h, "piflux", "history");
+		// The stub's ui.custom is a no-op that returns null (immediate Esc).
+		assert.equal(h.customCalls(), 1, "outcome selector opened (Esc closes the viewer)");
+		assert.equal(h.notifications.length, 0, "no notifications");
+		assert.equal(existsSync(h.stateFile) ? readFileSync(h.stateFile, "utf-8") : "", stateBefore, "nothing written");
+	} finally {
+		h.destroy();
+	}
+});
+
+test("/piflux history done skips the outcome selector and backs out to it on Esc", async () => {
+	const h = createHarness();
+	try {
+		writeArchive(h, "done", "my-feature", { outcome: "done", branch: "my-feature", finalStep: "ship", archivedAt: "2026-10-16T12:34:56.000Z", commit: HISTORY_COMMIT }, ["plan"]);
+		await runCommand(h, "piflux", "history done");
+		// The stub ui.custom returns null (= Esc) immediately: the archive list
+		// opens first (skipping the outcome selector), Esc backs out one level
+		// to the outcome selector, whose Esc closes the viewer.
+		assert.equal(h.customCalls(), 2, "archive list, then the outcome selector");
+		assert.equal(h.notifications.length, 0, "no notifications — the outcome has entries");
+	} finally {
+		h.destroy();
+	}
+});
+
 test("formatRelativeTime: just now, minutes, hours, days, and future mtimes", () => {
 	const now = 1_000_000_000_000;
 	assert.equal(formatRelativeTime(now, now), "just now");
@@ -2626,7 +2986,7 @@ test("agent_settled is gone: /done tolerates a state file that cannot be deleted
 	}
 });
 
-test("/piflux argument completions offer state, settings, and view", () => {
+test("/piflux argument completions offer state, settings, view, and history", () => {
 	const h = createHarness();
 	try {
 		const completions = h.commands.get("piflux")!.getArgumentCompletions!;
@@ -2634,10 +2994,11 @@ test("/piflux argument completions offer state, settings, and view", () => {
 		// completion never appends a space, and without one the target
 		// completions are unreachable (space never auto-triggers, TAB after
 		// a space is file completion).
-		assert.deepEqual(completions("")!.map((i) => i.value), ["state", "settings", "view "]);
+		assert.deepEqual(completions("")!.map((i) => i.value), ["state", "settings", "view ", "history "]);
 		assert.deepEqual(completions("s")!.map((i) => i.value), ["state", "settings"]);
 		assert.deepEqual(completions("st")!.map((i) => i.value), ["state"]);
 		assert.deepEqual(completions("v")!.map((i) => i.value), ["view "]);
+		assert.deepEqual(completions("h")!.map((i) => i.value), ["history "]);
 		assert.deepEqual(completions("c"), []);
 		assert.deepEqual(completions("x"), []);
 		// No second-token subcommands anymore.

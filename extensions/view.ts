@@ -15,10 +15,12 @@
  * scrolls native terminal scrollback (terminal-level constraint).
  *
  * This module is deliberately NOT a standalone extension: it exports only a
- * deps-injected factory (`createWorkflowViewer`) plus pure helpers, and the
- * package manifest pins `pi.extensions` to `["./extensions/index.ts"]`, so
- * this file can never be auto-discovered or loaded on its own. It exists
- * solely as the `/piflux` subcommand wired up in index.ts.
+ * deps-injected factory (`createWorkflowViewer`), the shared fullscreen pager
+ * (`openContentPager`), and pure helpers, and the package manifest pins
+ * `pi.extensions` to `["./extensions/index.ts"]`, so this file can never be
+ * auto-discovered or loaded on its own. It exists as the `/piflux view`
+ * implementation plus the shared overlay plumbing for `/piflux history`
+ * (history.ts), both wired up in index.ts.
  *
  * Read-only everywhere: no writes to the state file, settings file,
  * artifacts, or git; no state-machine changes; no session creation or
@@ -54,7 +56,11 @@ export interface WorkflowViewerDeps {
 	nextCommands: Record<string, string[]>;
 }
 
-const ARTIFACT_STEPS = ["start", "plan", "code", "review"] as const;
+/**
+ * The four artifact steps, in selector order. Exported so history.ts (the
+ * archived-artifact selector) shares one vocabulary with this module.
+ */
+export const ARTIFACT_STEPS = ["start", "plan", "code", "review"] as const;
 
 /**
  * The five direct-view targets, in selector order: `state` plus the four
@@ -348,95 +354,123 @@ export function createWorkflowViewer(deps: WorkflowViewerDeps): (ctx: ExtensionC
 			content = stripFrontmatter(readFileSync(path, "utf-8"));
 		}
 
-		// Full-screen overlay window: DynamicBorder frame + accent title + the
-		// pager's content slice + dim hint (with scroll percentage when the
-		// content overflows). The overlay is what makes wheel events receivable
-		// in fullscreen mode (focused overlay gets raw SGR/legacy wheel
-		// sequences); regular mode scrolls native scrollback, unchanged.
-		return ctx.ui.custom<void>(
-			(tui, theme, _kb, done) => {
-				const markdown = new Markdown(content, 1, 0, markdownTheme(theme));
-				const border = new DynamicBorder((s: string) => theme.fg("accent", s));
-				const title = new Text(theme.fg("accent", theme.bold(`${selected} — ${state.branch}`)), 1, 0);
-				const hint = new Text("", 1, 0);
+		return openContentPager(ctx, { title: `${selected} — ${state.branch}`, content, escLabel: escHint });
+	}
+}
 
-				// Self-managed pager state — the supported idiom on this rendering
-				// path (pi's Editor does the same): own scrollTop + a viewport-sized
-				// slice of the rendered lines. No ScrollView: its updateLayout() is
-				// only ever called by the layout engine, which never reaches
-				// extension components, so it cannot scroll here.
-				let scrollTop = 0;
-				let viewportHeight = Math.max(1, tui.terminal.rows - OVERLAY_CHROME);
-				let cachedWidth = -1;
-				let cachedLines: string[] = [];
-				let contentHeight = 0;
+// ------------------------------------------------------------------
+// Shared fullscreen pager (also used by history.ts)
+// ------------------------------------------------------------------
 
-				return {
-					render: (width: number) => {
-						// Viewport tracks the live terminal size; scrollTop is re-clamped
-						// every render so a shrink-while-scrolled (or a width change that
-						// re-wraps the markdown) can never leave the pager out of range.
-						viewportHeight = Math.max(1, tui.terminal.rows - OVERLAY_CHROME);
-						if (width !== cachedWidth) {
-							cachedLines = markdown.render(width);
-							cachedWidth = width;
-							contentHeight = cachedLines.length;
-						}
-						scrollTop = clampScrollTop(scrollTop, contentHeight, viewportHeight);
+export interface ContentPagerOptions {
+	/** Accent title line, rendered between the borders. */
+	title: string;
+	/** Markdown content to render (already snapshotted by the caller). */
+	content: string;
+	/** Wording for the esc hint: "back" (return one level) or "close". */
+	escLabel: string;
+}
 
-						const percent = scrollPercent(scrollTop, contentHeight, viewportHeight);
-						hint.setText(`arrows/pgup/pgdn/home/end/j/k: scroll · esc: ${escHint}${percent === null ? "" : ` · ${percent}%`}`);
+/**
+ * Full-screen overlay pager for markdown content, shared by `/piflux view`
+ * and `/piflux history`: DynamicBorder frame + accent title + the content
+ * slice + dim hint (with scroll percentage when the content overflows). The
+ * overlay is what makes wheel events receivable in fullscreen mode (focused
+ * overlay gets raw SGR/legacy wheel sequences); regular mode scrolls native
+ * scrollback, unchanged. Esc dismisses the overlay; the caller decides what
+ * screen (or close) that maps to.
+ *
+ * Snapshot semantics: `content` is rendered once when the screen opens and
+ * is never re-read — reopen to refresh.
+ */
+export function openContentPager(ctx: ExtensionCommandContext, options: ContentPagerOptions): Promise<void> {
+	return ctx.ui.custom<void>(
+		(tui, theme, _kb, done) => {
+			const markdown = new Markdown(options.content, 1, 0, markdownTheme(theme));
+			const border = new DynamicBorder((s: string) => theme.fg("accent", s));
+			const title = new Text(theme.fg("accent", theme.bold(options.title)), 1, 0);
+			const hint = new Text("", 1, 0);
 
-						const lines: string[] = [...border.render(width), ...title.render(width)];
-						const slice = cachedLines.slice(scrollTop, scrollTop + viewportHeight);
-						for (let i = 0; i < viewportHeight; i++) lines.push(slice[i] ?? " ".repeat(width));
-						lines.push(...hint.render(width), ...border.render(width));
-						return lines;
-					},
-					invalidate: () => {
-						cachedWidth = -1;
-						markdown.invalidate();
-						border.invalidate();
-						title.invalidate();
-						hint.invalidate();
-					},
-					handleInput: (data: string) => {
-						if (matchesKey(data, Key.escape)) {
-							done(); // back to the selector, or close the viewer in direct mode
-							return;
-						}
-						const wheel = parseWheelEvent(data);
-						if (wheel) {
-							// Wheel sequences only reach a focused overlay in fullscreen
-							// mode; regular mode cannot intercept the wheel at all.
-							if (tui.mode !== "fullscreen") return;
-							scrollTop += wheel.direction * WHEEL_SCROLL_LINES;
-							tui.requestRender();
-							return;
-						}
-						const target = keyToScrollDelta(data, viewportHeight);
-						if (target === null) return;
-						if (target === "home") {
-							scrollTop = 0;
-						} else if (target === "end") {
-							scrollTop = contentHeight; // render clamps to the real max
-						} else {
-							scrollTop += target;
-						}
+			// Self-managed pager state — the supported idiom on this rendering
+			// path (pi's Editor does the same): own scrollTop + a viewport-sized
+			// slice of the rendered lines. No ScrollView: its updateLayout() is
+			// only ever called by the layout engine, which never reaches
+			// extension components, so it cannot scroll here.
+			let scrollTop = 0;
+			let viewportHeight = Math.max(1, tui.terminal.rows - OVERLAY_CHROME);
+			let cachedWidth = -1;
+			let cachedLines: string[] = [];
+			let contentHeight = 0;
+
+			return {
+				render: (width: number) => {
+					// Viewport tracks the live terminal size; scrollTop is re-clamped
+					// every render so a shrink-while-scrolled (or a width change that
+					// re-wraps the markdown) can never leave the pager out of range.
+					viewportHeight = Math.max(1, tui.terminal.rows - OVERLAY_CHROME);
+					if (width !== cachedWidth) {
+						cachedLines = markdown.render(width);
+						cachedWidth = width;
+						contentHeight = cachedLines.length;
+					}
+					scrollTop = clampScrollTop(scrollTop, contentHeight, viewportHeight);
+
+					const percent = scrollPercent(scrollTop, contentHeight, viewportHeight);
+					hint.setText(`arrows/pgup/pgdn/home/end/j/k: scroll · esc: ${options.escLabel}${percent === null ? "" : ` · ${percent}%`}`);
+
+					const lines: string[] = [...border.render(width), ...title.render(width)];
+					const slice = cachedLines.slice(scrollTop, scrollTop + viewportHeight);
+					for (let i = 0; i < viewportHeight; i++) lines.push(slice[i] ?? " ".repeat(width));
+					lines.push(...hint.render(width), ...border.render(width));
+					return lines;
+				},
+				invalidate: () => {
+					cachedWidth = -1;
+					markdown.invalidate();
+					border.invalidate();
+					title.invalidate();
+					hint.invalidate();
+				},
+				handleInput: (data: string) => {
+					if (matchesKey(data, Key.escape)) {
+						done(); // the caller maps dismissal to its back/close semantics
+						return;
+					}
+					const wheel = parseWheelEvent(data);
+					if (wheel) {
+						// Wheel sequences only reach a focused overlay in fullscreen
+						// mode; regular mode cannot intercept the wheel at all.
+						if (tui.mode !== "fullscreen") return;
+						scrollTop += wheel.direction * WHEEL_SCROLL_LINES;
 						tui.requestRender();
-					},
+						return;
+					}
+					const target = keyToScrollDelta(data, viewportHeight);
+					if (target === null) return;
+					if (target === "home") {
+						scrollTop = 0;
+					} else if (target === "end") {
+						scrollTop = contentHeight; // render clamps to the real max
+					} else {
+						scrollTop += target;
+					}
+					tui.requestRender();
+				},
 			};
 		},
-			{ overlay: true, overlayOptions: { width: "100%", maxHeight: "100%", anchor: "center", margin: OVERLAY_MARGIN } },
-		);
-	}
+		{ overlay: true, overlayOptions: { width: "100%", maxHeight: "100%", anchor: "center", margin: OVERLAY_MARGIN } },
+	);
 }
 
 // ------------------------------------------------------------------
 // Theme helpers (mirror the settings overlay's styling)
 // ------------------------------------------------------------------
 
-function selectListTheme(theme: Theme) {
+/**
+ * SelectList color mapping shared by the view and history selectors (mirrors
+ * the settings overlay's styling). Exported so history.ts reuses one copy.
+ */
+export function selectListTheme(theme: Theme) {
 	return {
 		selectedPrefix: (t: string) => theme.fg("accent", t),
 		selectedText: (t: string) => theme.fg("accent", t),

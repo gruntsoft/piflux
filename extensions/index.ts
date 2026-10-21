@@ -47,6 +47,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Container, Key, matchesKey, SelectList, Text } from "@earendil-works/pi-tui";
 import { createWorkflowViewer, isViewTarget, viewArgumentCompletions } from "./view.ts";
+import { createHistoryViewer, historyArgumentCompletions, isHistoryOutcome } from "./history.ts";
 
 type StepName = "start" | "plan" | "code" | "review" | "icode" | "ireview" | "ship" | "done" | "abandon";
 type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
@@ -1367,8 +1368,13 @@ export default function workflowOrchestrator(pi: ExtensionAPI) {
 	// module only exports the factory plus pure helpers.
 	const workflowViewer = createWorkflowViewer({ readState, nextCommands: NEXT_COMMANDS });
 
+	// /piflux history — read-only archived-workflow viewer (history.ts), also
+	// deps-free: it reads only the filesystem plus ctx.cwd, so no active
+	// workflow needs to exist for it to work.
+	const historyViewer = createHistoryViewer();
+
 	pi.registerCommand("piflux", {
-		description: "Workflow orchestrator — state, settings, view",
+		description: "Workflow orchestrator — state, settings, view, history",
 		getArgumentCompletions: (prefix: string) => {
 			// Second-token completion for `/piflux view <TAB>` first. The
 			// completion callback has no ctx/cwd, so the state is read from
@@ -1378,8 +1384,12 @@ export default function workflowOrchestrator(pi: ExtensionAPI) {
 			// returns null on any doubt.
 			const viewItems = viewArgumentCompletions(prefix, readState(process.cwd()), process.cwd());
 			if (viewItems) return viewItems;
-			// First-token filter. The "view" value carries a trailing space:
-			// pi's argument completion replaces only the argument text (no
+			// Second-token completion for `/piflux history <TAB>`: the two
+			// outcome tokens (no active workflow needed, so no state read).
+			const historyItems = historyArgumentCompletions(prefix, process.cwd());
+			if (historyItems) return historyItems;
+			// First-token filter. The "view"/"history" values carry a trailing
+			// space: pi's argument completion replaces only the argument text (no
 			// space is appended), and the editor never opens the autocomplete
 			// popup on a bare space nor via TAB after one — so without it,
 			// accepting "view" strands the line at "/piflux view" and the
@@ -1390,6 +1400,7 @@ export default function workflowOrchestrator(pi: ExtensionAPI) {
 				{ value: "state", label: "state" },
 				{ value: "settings", label: "settings" },
 				{ value: "view ", label: "view" },
+				{ value: "history ", label: "history" },
 			];
 			return items.filter((i) => i.value.startsWith(prefix));
 		},
@@ -1420,8 +1431,21 @@ export default function workflowOrchestrator(pi: ExtensionAPI) {
 					}
 					ctx.ui.notify("Usage: /piflux view [state|start|plan|code|review]", "warning");
 					return;
+				case "history":
+					// No active workflow required: history browsing works
+					// mid-workflow or with none running.
+					if (tokens.length === 1) {
+						await historyViewer(ctx);
+						return;
+					}
+					if (tokens.length === 2 && isHistoryOutcome(tokens[1])) {
+						await historyViewer(ctx, tokens[1]);
+						return;
+					}
+					ctx.ui.notify("Usage: /piflux history [done|abandoned]", "warning");
+					return;
 			}
-			ctx.ui.notify("Usage: /piflux [state|settings|view]", "warning");
+			ctx.ui.notify("Usage: /piflux [state|settings|view|history]", "warning");
 		},
 	});
 
