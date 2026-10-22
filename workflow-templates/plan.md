@@ -16,6 +16,8 @@ Check for a start artifact at `$WORKFLOW_DIR/<branch>/start.md`. If it does not 
 
 Read the `## Metadata` section of the start artifact for the base branch. If it's missing, ask the human for the base branch before proceeding.
 
+Also read the `Branch created by workflow` flag from the same section — absent line means `true` (created); `/start` records `false` when it adopted an existing branch. This decides whether Phase 2 item 8 applies.
+
 ## Phase 2: Collaborative Planning
 
 The user wants to accomplish: **$@**. If empty, ask them what they'd like to plan.
@@ -29,7 +31,7 @@ Engage the user in a structured conversation. Cover these topics in order:
 5. **Verification** — How do we confirm the change works? What test commands? What manual checks? What should the user observe?
 6. **Guardrails** — What must NOT change? What constraints exist (API boundaries, performance budgets, compatibility)? What edge cases demand special care?
 7. **Merge strategy** — how should `/ship` integrate the branch into the base: `squash` (fold all commits into one) or `merge` (preserve history with a `--no-ff` merge commit)?
-8. **Delete remote branch** — should `/done` delete the remote feature branch after the merge (`true`), or keep it alive on the remote (`false`)?
+8. **Delete remote branch** — should `/done` delete the remote feature branch after the merge (`true`), or keep it alive on the remote (`false`)? Skip this question when the start artifact records `Branch created by workflow: false` — an adopted branch is never deleted, so there is nothing to decide and no metadata line to write.
 9. **Version bump** — does this change bump the version? If so, what are the old and new versions? And — only when bumping — should `/ship` tag the release? Tagging is never automatic: it is an explicit decision made here, at planning time. Absent `Tag release` metadata means no tag.
 
 **During this phase:**
@@ -50,7 +52,7 @@ mkdir -p "$WORKFLOW_DIR/<branch>"
 Capture the metadata you'll record in the plan file:
 - **Base branch**: the base branch read from the start artifact (Phase 1).
 - **Merge strategy**: `squash` or `merge` — the human's choice from Phase 2 item 7.
-- **Delete remote branch**: `true` or `false` — the human's choice from Phase 2 item 8.
+- **Delete remote branch** (only for a branch created by the workflow): `true` or `false` — the human's choice from Phase 2 item 8; omit the line entirely for an adopted branch.
 - **Old version / New version** (optional): the current and target versions — only when a version bump is part of the change (Phase 2 item 9).
 - **Tag release** (optional): `true` or `false` — the human's choice from Phase 2 item 9, only when a version bump is declared. Absent field means no tag.
 
@@ -89,6 +91,7 @@ Write the plan file with this exact structure (the HTML comments are instruction
 - Base branch: <branch the new branch was created from>
 - Merge strategy: <squash | merge — how /ship integrates the branch into the base>
 - Delete remote branch: <true | false — whether /done deletes the remote feature branch after the merge>
+<!-- Delete remote branch is optional — include it only when the start artifact records the branch as created by the workflow (flag true, or no flag line — the backward-compatible default). An adopted branch is never deleted: omit the line entirely. -->
 <!-- Old version and New version are optional — include them only when a version bump is part of the change. /ship creates the release tag from New version when Tag release is true, using the value verbatim (any prefix like `v` must be written into New version itself). -->
 - Old version: <current version — only when this change bumps the version>
 - New version: <new version — only when this change bumps the version>

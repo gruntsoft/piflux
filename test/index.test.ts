@@ -340,13 +340,18 @@ function writeStartArtifact(dir: string, branch: string): void {
 	writeFileSync(join(branchDir, "start.md"), `# Start: ${branch}\n`);
 }
 
-/** Writes a start artifact with the Feature branch/Base branch metadata pair the template produces. */
-function writeStartArtifactWithMetadata(dir: string, branch: string, base: string): void {
+/**
+ * Writes a start artifact with the Feature branch/Base branch metadata pair
+ * the template produces; passing createdByWorkflow adds the ownership line
+ * (omitted entirely for legacy artifacts when left undefined).
+ */
+function writeStartArtifactWithMetadata(dir: string, branch: string, base: string, createdByWorkflow?: boolean): void {
 	const branchDir = join(workflowRootFor(dir), branch);
 	mkdirSync(branchDir, { recursive: true });
+	const ownership = createdByWorkflow === undefined ? "" : `- Branch created by workflow: ${createdByWorkflow}\n`;
 	writeFileSync(
 		join(branchDir, "start.md"),
-		`# Start: ${branch}\n\n## Metadata\n- Feature branch: ${branch}\n- Base branch: ${base}\n`,
+		`# Start: ${branch}\n\n## Metadata\n- Feature branch: ${branch}\n- Base branch: ${base}\n${ownership}`,
 	);
 }
 
@@ -749,6 +754,97 @@ test("/done honors Delete remote branch: false and keeps the remote branch", asy
 		);
 		const summary = h.notifications.find((n) => n.msg.includes("torn down"));
 		assert.ok(summary.msg.includes("Remote branch: kept per plan"), "keep outcome reported");
+	} finally {
+		if (bare) rmSync(bare, { recursive: true, force: true });
+		h.destroy();
+	}
+});
+
+test("/done on an adopted branch keeps both branches and reports the keeps", async () => {
+	const h = createHarness();
+	let bare = "";
+	try {
+		bare = setupGitRepo(h, { remoteBranch: true });
+		const repo = h.projectDir;
+		writePlanFile(h);
+		// Adopted branch: the start artifact records ownership false.
+		writeStartArtifactWithMetadata(repo, "my-feature", "master", false);
+		writeFileSync(h.stateFile, JSON.stringify({ step: "ship", branch: "my-feature", sessions: {} }));
+
+		await runCommand(h, "done");
+
+		// Ownership respected: both branches survive — no plan override exists.
+		assert.doesNotThrow(() => git(bare, ["show-ref", "--verify", "--quiet", "refs/heads/my-feature"]), "remote branch kept");
+		assert.doesNotThrow(() => git(repo, ["show-ref", "--verify", "--quiet", "refs/heads/my-feature"]), "local branch kept");
+
+		// Everything else of the teardown still happened.
+		assert.equal(git(repo, ["branch", "--show-current"]), "master", "switched to base");
+		assert.ok(!existsSync(h.stateFile), "teardown completed");
+		const archiveDir = join(h.globalDir, "piflux", "history", encodeSessionDirName(repo), "done", "my-feature");
+		assert.ok(existsSync(join(archiveDir, "workflow.json")), "artifacts archived to done/");
+
+		const summary = h.notifications.find((n) => n.msg.includes("torn down"));
+		assert.ok(summary, "summary notification shown");
+		assert.ok(summary.msg.includes("Remote branch: kept (adopted — not created by the workflow)"), "remote keep reported");
+		assert.ok(summary.msg.includes("Local branch my-feature: kept (adopted — not created by the workflow)"), "local keep reported");
+	} finally {
+		if (bare) rmSync(bare, { recursive: true, force: true });
+		h.destroy();
+	}
+});
+
+test("/done with a missing start artifact warns and treats the branch as created", async () => {
+	const h = createHarness();
+	let bare = "";
+	try {
+		bare = setupGitRepo(h, { remoteBranch: true });
+		const repo = h.projectDir;
+		writePlanFile(h);
+		// No start artifact at all — an unexpected state (start always writes
+		// one): warn, fall back to created, delete both branches.
+		writeFileSync(h.stateFile, JSON.stringify({ step: "ship", branch: "my-feature", sessions: {} }));
+
+		await runCommand(h, "done");
+
+		assert.ok(
+			h.notifications.some((n) => n.type === "warning" && n.msg.includes("start artifact")),
+			"missing start artifact warned",
+		);
+		assert.throws(() => git(bare, ["show-ref", "--verify", "--quiet", "refs/heads/my-feature"]), "remote deleted (created fallback)");
+		assert.throws(() => git(repo, ["show-ref", "--verify", "--quiet", "refs/heads/my-feature"]), "local deleted (created fallback)");
+		const summary = h.notifications.find((n) => n.msg.includes("torn down"));
+		assert.ok(summary.msg.includes("Local branch my-feature: deleted"), "deletion reported");
+	} finally {
+		if (bare) rmSync(bare, { recursive: true, force: true });
+		h.destroy();
+	}
+});
+
+test("/done with a legacy start artifact (no ownership flag) deletes both branches as before", async () => {
+	const h = createHarness();
+	let bare = "";
+	try {
+		bare = setupGitRepo(h, { remoteBranch: true });
+		const repo = h.projectDir;
+		writePlanFile(h);
+		// Artifact present and readable, ownership line absent: parsed null →
+		// ?? true — the destructive legacy default /done applies without a
+		// confirm dialog. Distinct from the missing-artifact fallback above.
+		writeStartArtifactWithMetadata(repo, "my-feature", "master");
+		writeFileSync(h.stateFile, JSON.stringify({ step: "ship", branch: "my-feature", sessions: {} }));
+
+		h.notifications.length = 0;
+		await runCommand(h, "done");
+
+		// No warning: the artifact exists and parses fine — the null comes
+		// from the absent line, not a missing or unreadable file.
+		assert.ok(!h.notifications.some((n) => n.type === "warning"), "no warning for a readable legacy artifact");
+		assert.throws(() => git(bare, ["show-ref", "--verify", "--quiet", "refs/heads/my-feature"]), "remote branch deleted (legacy default)");
+		assert.throws(() => git(repo, ["show-ref", "--verify", "--quiet", "refs/heads/my-feature"]), "local branch deleted (legacy default)");
+		const summary = h.notifications.find((n) => n.msg.includes("torn down"));
+		assert.ok(summary, "summary notification shown");
+		assert.ok(summary.msg.includes("Remote branch: deleted from origin"), "remote deletion reported");
+		assert.ok(summary.msg.includes("Local branch my-feature: deleted"), "local deletion reported");
 	} finally {
 		if (bare) rmSync(bare, { recursive: true, force: true });
 		h.destroy();
@@ -1264,6 +1360,114 @@ test("/abandon honors Delete remote branch: false and keeps the remote branch", 
 	}
 });
 
+test("/abandon on an adopted branch keeps both branches, still discards the tree, and archives", async () => {
+	const h = createHarness();
+	let bare = "";
+	try {
+		bare = setupGitRepo(h, { remoteBranch: true });
+		const repo = h.projectDir;
+		// Adopted branch: the start artifact records ownership false.
+		writeStartArtifactWithMetadata(repo, "my-feature", "master", false);
+		// Dirty the tree: the discard still applies to adopted branches (the
+		// dirtying is workflow-era work — start demanded a clean tree).
+		writeFileSync(join(repo, "tracked.txt"), "dirty\n");
+		writeFileSync(join(repo, "untracked.txt"), "untracked\n");
+		const sessions = { start: join(repo, "sessions", "start.jsonl") };
+		mkdirSync(join(repo, "sessions"), { recursive: true });
+		writeFileSync(sessions.start, "");
+		writeFileSync(h.stateFile, JSON.stringify({ step: "code", branch: "my-feature", sessions }));
+
+		h.setConfirmResult(true);
+		h.notifications.length = 0;
+		await runCommand(h, "abandon");
+
+		// Confirm text reflects the adoption truthfully: no branch deletion.
+		const confirm = h.confirmCalls()[0];
+		assert.ok(confirm.includes("discard all uncommitted changes on `my-feature`"), "confirm still warns about the discard");
+		assert.ok(confirm.includes("kept locally and on origin"), "confirm says the branch is kept");
+		assert.ok(confirm.includes("adopted"), "confirm names the adoption");
+		assert.ok(!confirm.includes("delete `my-feature`"), "confirm does not claim branch deletion");
+
+		// Git: tree discarded and back on base, but both branches survive.
+		assert.equal(git(repo, ["branch", "--show-current"]), "master");
+		assert.equal(git(repo, ["status", "--porcelain"]), "", "tree discarded even on an adopted branch");
+		assert.equal(readFileSync(join(repo, "tracked.txt"), "utf-8"), "base\n", "tracked modification reverted");
+		assert.ok(!existsSync(join(repo, "untracked.txt")), "untracked file removed");
+		assert.doesNotThrow(() => git(repo, ["show-ref", "--verify", "--quiet", "refs/heads/my-feature"]), "local branch kept");
+		assert.doesNotThrow(() => git(bare, ["show-ref", "--verify", "--quiet", "refs/heads/my-feature"]), "remote branch kept");
+
+		// The workflow teardown still happens, archive lands in abandoned/.
+		assert.ok(!existsSync(h.stateFile), "state file deleted");
+		assert.ok(!existsSync(sessions.start), "session file deleted");
+		const archiveDir = join(h.globalDir, "piflux", "history", encodeSessionDirName(repo), "abandoned", "my-feature");
+		assert.ok(!existsSync(join(workflowRootFor(repo), "my-feature")), "branch dir moved out of workflows");
+		assert.ok(existsSync(join(archiveDir, "start.md")), "start artifact archived to abandoned/");
+
+		// Summary reports the keeps truthfully.
+		const summary = h.notifications.find((n) => n.msg.includes("abandoned"));
+		assert.ok(summary, "summary notification shown");
+		assert.ok(summary.msg.includes("Remote branch: kept (adopted — not created by the workflow)"), "remote keep reported");
+		assert.ok(summary.msg.includes("Local branch my-feature: kept (adopted — not created by the workflow)"), "local keep reported");
+		assert.ok(summary.msg.includes("Working tree: discarded"), "tree discard reported");
+	} finally {
+		if (bare) rmSync(bare, { recursive: true, force: true });
+		h.destroy();
+	}
+});
+
+test("/abandon on an adopted branch ignores Delete remote branch: true — the veto holds", async () => {
+	const h = createHarness();
+	let bare = "";
+	try {
+		bare = setupGitRepo(h, { remoteBranch: true });
+		const repo = h.projectDir;
+		writeStartArtifactWithMetadata(repo, "my-feature", "master", false);
+		// A plan explicitly asking for deletion must not override adoption.
+		writePlanFile(h, "- Delete remote branch: true");
+		writeFileSync(h.stateFile, JSON.stringify({ step: "code", branch: "my-feature", sessions: {} }));
+
+		h.setConfirmResult(true);
+		h.notifications.length = 0;
+		await runCommand(h, "abandon");
+
+		assert.doesNotThrow(() => git(bare, ["show-ref", "--verify", "--quiet", "refs/heads/my-feature"]), "remote kept despite the plan");
+		assert.doesNotThrow(() => git(repo, ["show-ref", "--verify", "--quiet", "refs/heads/my-feature"]), "local kept despite the plan");
+		const summary = h.notifications.find((n) => n.msg.includes("abandoned"));
+		assert.ok(summary.msg.includes("kept (adopted — not created by the workflow)"), "adopted keep reported");
+		assert.ok(!h.notifications.some((n) => n.msg.includes("intentionally kept on origin")), "plan keep-note not shown (plan gate not consulted)");
+	} finally {
+		if (bare) rmSync(bare, { recursive: true, force: true });
+		h.destroy();
+	}
+});
+
+test("/abandon with a legacy start artifact (no ownership flag) deletes both branches as before", async () => {
+	const h = createHarness();
+	let bare = "";
+	try {
+		bare = setupGitRepo(h, { remoteBranch: true });
+		const repo = h.projectDir;
+		// Pre-flag artifact: absent ownership line parses to null → created →
+		// today's delete behavior, plan gate included.
+		writeStartArtifactWithMetadata(repo, "my-feature", "master");
+		writePlanFile(h, "- Delete remote branch: true");
+		writeFileSync(h.stateFile, JSON.stringify({ step: "code", branch: "my-feature", sessions: {} }));
+
+		h.setConfirmResult(true);
+		h.notifications.length = 0;
+		await runCommand(h, "abandon");
+
+		assert.throws(() => git(bare, ["show-ref", "--verify", "--quiet", "refs/heads/my-feature"]), "remote branch deleted");
+		assert.throws(() => git(repo, ["show-ref", "--verify", "--quiet", "refs/heads/my-feature"]), "local branch deleted");
+		const summary = h.notifications.find((n) => n.msg.includes("abandoned"));
+		assert.ok(summary.msg.includes("Local branch my-feature: deleted"), "legacy deletion behavior kept");
+		assert.ok(summary.msg.includes("Remote branch: deleted from origin"), "remote deletion reported");
+	} finally {
+		if (bare) rmSync(bare, { recursive: true, force: true });
+		h.destroy();
+	}
+});
+
 test("/abandon with a start artifact missing Base branch metadata warns and leaves git untouched", async () => {
 	const h = createHarness();
 	let bare = "";
@@ -1465,6 +1669,26 @@ test("parsePlanMetadata: New version and Tag release, absent Tag release means n
 	const oldStyle = parsePlanMetadata("## Metadata\n- New version: 1.4.0\n");
 	assert.equal(oldStyle.newVersion, "1.4.0");
 	assert.equal(oldStyle.tagRelease, null, "absent Tag release means no tag");
+});
+
+test("parsePlanMetadata: Branch created by workflow, absent means null (caller defaults to created)", () => {
+	const created = parsePlanMetadata("## Metadata\n- Feature branch: wip\n- Base branch: master\n- Branch created by workflow: true\n");
+	assert.equal(created.branchCreatedByWorkflow, true);
+
+	const adopted = parsePlanMetadata("## Metadata\n- Feature branch: wip\n- Base branch: main\n- Branch created by workflow: false\n");
+	assert.equal(adopted.branchCreatedByWorkflow, false);
+
+	const legacy = parsePlanMetadata("## Metadata\n- Feature branch: wip\n- Base branch: master\n");
+	assert.equal(legacy.branchCreatedByWorkflow, null, "absent flag is null (caller defaults to created)");
+
+	// Prose mentioning the phrase, or a malformed value, must not match —
+	// the regex anchors to the `- Key: value` metadata form.
+	const prose = parsePlanMetadata("The branch created by workflow: maybe\n- Branch created by workflow: maybe\n");
+	assert.equal(prose.branchCreatedByWorkflow, null);
+
+	// Whitespace tolerance mirrors the other fields.
+	const spaced = parsePlanMetadata("-   Branch created by workflow:   false   \n");
+	assert.equal(spaced.branchCreatedByWorkflow, false);
 });
 
 test("serializeSettings emits only the given steps with a trailing newline", () => {

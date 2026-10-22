@@ -37,15 +37,15 @@ This repository is a Pi package that encodes my personal coding agent workflow. 
 
 The package implements a start → plan → code → review → icode ⇄ ireview → ship → done cycle across separate sessions (see `README.md`):
 
-- `/start <branch>` — step 0: sets up a feature branch `<branch>`, writes the start artifact
+- `/start <branch>` — step 0: sets up a feature branch `<branch>` — creating it, or adopting an existing local branch of that name (a remote-only name is refused) — and writes the start artifact, which records whether the branch was created by the workflow
 - `/plan <description>` — collaborative planning, writes the plan artifact
 - `/code` — reads the plan for the current branch, implements it, writes the code artifact
 - `/review` — reviews uncommitted changes against the plan, writes the review artifact, stages the reviewed files (the files listed in the code artifact)
 - `/icode` — implements fixes for open review findings, checks them off, overwrites the code artifact
 - `/ireview` — verifies the `/icode` fixes, overwrites the review artifact, stages the reviewed files
 - `/ship` — commits with a human-approved message, merges into the base branch (squash by default, or a `--no-ff` merge commit per the plan's `Merge strategy`), pushes, and tags the release when the plan declares `Tag release: true`
-- `/done` — full teardown (pure extension code, no agent session): deletes the remote feature branch (per the plan), switches to the base branch, deletes the local feature branch, then removes all workflow sessions and archives the artifacts to the history `done/` subtree. Idempotent — a failed `/done` can be re-run.
-- `/abandon` — abort from any step: discards uncommitted work on the feature branch, deletes the branch locally and on origin (best-effort), returns to the base branch, then removes all workflow sessions and archives the artifacts to the history `abandoned/` subtree (an optional free-text reason is recorded there); `--force` covers a corrupt workflow state
+- `/done` — full teardown (pure extension code, no agent session): deletes the remote feature branch (per the plan) and the local feature branch — but only when the workflow created the branch; an adopted branch is kept in both places — switches to the base branch, then removes all workflow sessions and archives the artifacts to the history `done/` subtree. Idempotent — a failed `/done` can be re-run.
+- `/abandon` — abort from any step: discards uncommitted work on the feature branch, deletes the branch locally and on origin (best-effort) — unless the workflow only adopted it, in which case the branch is kept in both places — returns to the base branch, then removes all workflow sessions and archives the artifacts to the history `abandoned/` subtree (an optional free-text reason is recorded there); `--force` covers a corrupt workflow state
 
 Each step runs in a fresh session — except `/icode` and `/ireview`, which share sessions with `/code` and `/review`: they iterate on the same branch and artifacts instead of starting the cycle over.
 

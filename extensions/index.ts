@@ -317,13 +317,18 @@ export function unsetStepInFile(file: string, step: StepName): boolean {
 // ------------------------------------------------------------------
 
 /**
- * The plan metadata `/done` acts on. Absent lines parse to `null` — the
- * callers decide the fallback (`Delete remote branch` absent → delete;
- * `Tag release` absent → no tag).
+ * The plan metadata `/done` acts on — plus the start artifact's ownership
+ * flag, parsed with the same parser (`parsePlanMetadata` is
+ * section-agnostic, so start.md's Metadata block reads the same way).
+ * Absent lines parse to `null` — the callers decide the fallback
+ * (`Delete remote branch` absent → delete; `Tag release` absent → no tag;
+ * `Branch created by workflow` absent → created, so artifacts written
+ * before the field existed keep the destructive default).
  */
 export interface PlanMetadata {
 	baseBranch: string | null;
 	deleteRemoteBranch: boolean | null;
+	branchCreatedByWorkflow: boolean | null;
 	newVersion: string | null;
 	tagRelease: boolean | null;
 }
@@ -342,6 +347,7 @@ export function parsePlanMetadata(content: string): PlanMetadata {
 	return {
 		baseBranch: line(/^\s*-\s*Base branch:\s*(\S+)[ \t]*$/m),
 		deleteRemoteBranch: bool(/^\s*-\s*Delete remote branch:\s*(true|false)[ \t]*$/m),
+		branchCreatedByWorkflow: bool(/^\s*-\s*Branch created by workflow:\s*(true|false)[ \t]*$/m),
 		newVersion: line(/^\s*-\s*New version:\s*(\S+)[ \t]*$/m),
 		tagRelease: bool(/^\s*-\s*Tag release:\s*(true|false)[ \t]*$/m),
 	};
@@ -961,12 +967,17 @@ export default function workflowOrchestrator(pi: ExtensionAPI) {
 	/**
 	 * /done is pure extension teardown — no agent session. In order:
 	 * validate the transition (ship or done state), read the plan metadata
-	 * (Base branch required; Delete remote branch defaults to true), mark the
-	 * state `step: "done"` so a failed run is retryable, then the git work:
-	 * remote branch deletion (plan-gated, best-effort — absent is detected
-	 * via `git ls-remote` exit code 2 and skipped silently), checkout of the
-	 * base branch (failure aborts with the state intact), local branch
-	 * deletion with `-D` (already-gone counts as success). On success the
+	 * (Base branch required; Delete remote branch defaults to true) plus the
+	 * start artifact's ownership flag (`Branch created by workflow`, absent →
+	 * created — a missing/unreadable start artifact warns and keeps that
+	 * default), mark the state `step: "done"` so a failed run is retryable,
+	 * then the git work: remote branch deletion (plan-gated, best-effort —
+	 * absent is detected via `git ls-remote` exit code 2 and skipped
+	 * silently; skipped entirely for adopted branches — the workflow only
+	 * cleans up what it created), checkout of the base branch (failure
+	 * aborts with the state intact), local branch deletion with `-D`
+	 * (already-gone counts as success; skipped for adopted branches, which
+	 * also removes the fail-closed abort path for them). On success the
 	 * clean-slate teardown (switchToCleanSlate → performCleanup) removes
 	 * the sessions, archives the artifacts, and removes the state file, then
 	 * the final summary is reported — so the summary reflects what actually
@@ -1012,13 +1023,40 @@ export default function workflowOrchestrator(pi: ExtensionAPI) {
 		const baseBranch = metadata.baseBranch;
 		const deleteRemote = metadata.deleteRemoteBranch ?? true;
 
+		// Branch ownership comes from the start artifact — the only record of
+		// whether /start created the branch. Absent flag → created (true):
+		// artifacts written before the field existed keep today's delete
+		// behavior — the plan's explicit backward-compat rule. The residual
+		// risk this accepts: pre-change /start sessions could adopt an
+		// existing branch via improvisation (the near-loss accident that
+		// motivated ownership tracking), so a legacy artifact may record an
+		// adopted branch, and this default cannot detect it. A
+		// missing/unreadable start artifact is unexpected (start always
+		// writes one) — warn and keep the default.
+		const startPath = artifactPath(cwd, branch, "start");
+		let branchCreatedByWorkflow = true;
+		if (!existsSync(startPath)) {
+			ctx.ui.notify(`The start artifact at ${startPath} is missing — treating the branch as created by this workflow.`, "warning");
+		} else {
+			try {
+				branchCreatedByWorkflow = parsePlanMetadata(readFileSync(startPath, "utf-8")).branchCreatedByWorkflow ?? true;
+			} catch {
+				ctx.ui.notify(`Could not read the start artifact at ${startPath} — treating the branch as created by this workflow.`, "warning");
+			}
+		}
+
 		// Mark the workflow "done" before any git work: a failed or
 		// interrupted /done leaves a retryable state.
 		writeState(cwd, { step: "done", branch, sessions: state!.sessions });
 
-		// (a) Remote branch deletion is plan-gated.
+		// (a) Remote branch deletion is plan-gated — and ownership-gated:
+		// adopted branches are never deleted, the plan is not consulted for
+		// them (its Delete remote branch field was authored for /done's
+		// post-merge cleanup of created branches).
 		let remoteOutcome: string;
-		if (!deleteRemote) {
+		if (!branchCreatedByWorkflow) {
+			remoteOutcome = "kept (adopted — not created by the workflow)";
+		} else if (!deleteRemote) {
 			remoteOutcome = "kept per plan (Delete remote branch: false)";
 			ctx.ui.notify(`The plan declares Delete remote branch: false — the remote branch ${branch} is intentionally kept on origin.`, "info");
 		} else {
@@ -1045,17 +1083,26 @@ export default function workflowOrchestrator(pi: ExtensionAPI) {
 		const head = gitCommand(cwd, ["rev-parse", "HEAD"]);
 		const commit = head.ok ? head.output : null;
 
-		// (c) Delete the local feature branch. A branch that is already gone
-		// (git's "not found" error, exit 1) is the ENOENT-equivalent — a
-		// previous run deleted it — and counts as success. Anything else
-		// aborts with the state intact.
-		const del = deleteLocalBranch(cwd, branch);
-		if (!del.ok) {
-			ctx.ui.notify(
-				`Could not delete the local branch ${branch} — ${del.stderr}. /done aborted; nothing was destroyed and the workflow state is intact — /done can be re-run.`,
-				"error",
-			);
-			return;
+		// (c) Delete the local feature branch — unless the branch was only
+		// adopted (same ownership principle as (a): a two-second manual
+		// `git branch -D` when truly wanted beats silent destruction of a
+		// pre-existing branch). A branch that is already gone (git's "not
+		// found" error, exit 1) is the ENOENT-equivalent — a previous run
+		// deleted it — and counts as success. Anything else aborts with the
+		// state intact.
+		let localOutcome: string;
+		if (!branchCreatedByWorkflow) {
+			localOutcome = "kept (adopted — not created by the workflow)";
+		} else {
+			const del = deleteLocalBranch(cwd, branch);
+			if (!del.ok) {
+				ctx.ui.notify(
+					`Could not delete the local branch ${branch} — ${del.stderr}. /done aborted; nothing was destroyed and the workflow state is intact — /done can be re-run.`,
+					"error",
+				);
+				return;
+			}
+			localOutcome = "deleted";
 		}
 
 		// (f) Success: the tag outcome is reported, not performed — /ship creates
@@ -1088,7 +1135,7 @@ export default function workflowOrchestrator(pi: ExtensionAPI) {
 			[
 				`Workflow \"${branch}\" torn down.`,
 				`- Remote branch: ${remoteOutcome}`,
-				`- Local branch ${branch}: deleted`,
+				`- Local branch ${branch}: ${localOutcome}`,
 				`- Current branch: ${baseBranch}`,
 				`- Working tree: ${treeState}`,
 				`- Release tag: ${tagOutcome}`,
@@ -1139,6 +1186,12 @@ export default function workflowOrchestrator(pi: ExtensionAPI) {
 	 *    feature → remote best-effort → artifact archive; stay put
 	 * 6. on other + no feature: remote best-effort → artifact archive
 	 *
+	 * Adopted branches (start.md `Branch created by workflow: false`, absent
+	 * → created) replace both deletion steps with keeps in every case — the
+	 * workflow cleans up only what it created, and the plan's `Delete remote
+	 * branch` never overrides adoption. The tree discard, the checkout, the
+	 * teardown, and the archive are identical for adopted branches.
+	 *
 	 * The base branch comes from the start artifact's `Base branch` metadata
 	 * (start.md always exists post-/start). Missing/unreadable/metadata-less
 	 * → warn, artifact archive only, no git ops at all.
@@ -1179,14 +1232,20 @@ export default function workflowOrchestrator(pi: ExtensionAPI) {
 		}
 		const branch = state.branch;
 
-		// Base branch from the start artifact — /abandon is valid from any
-		// step, including before /plan exists, so the plan is never consulted
-		// for it. Reuse the regex-based parsePlanMetadata: section-agnostic,
-		// so start.md's own Metadata block parses the same way as plan.md's.
+		// Base branch and branch ownership from the start artifact — /abandon
+		// is valid from any step, including before /plan exists, so the plan
+		// is never consulted for either. Reuse the regex-based
+		// parsePlanMetadata: section-agnostic, so start.md's own Metadata
+		// block parses the same way as plan.md's. Absent ownership flag →
+		// created (true): artifacts written before the field existed keep
+		// today's delete behavior.
 		const startPath = artifactPath(cwd, branch, "start");
 		let baseBranch: string | null = null;
+		let branchCreatedByWorkflow = true;
 		try {
-			baseBranch = parsePlanMetadata(readFileSync(startPath, "utf-8")).baseBranch;
+			const startMeta = parsePlanMetadata(readFileSync(startPath, "utf-8"));
+			baseBranch = startMeta.baseBranch;
+			branchCreatedByWorkflow = startMeta.branchCreatedByWorkflow ?? true;
 		} catch {
 			baseBranch = null;
 		}
@@ -1219,10 +1278,14 @@ export default function workflowOrchestrator(pi: ExtensionAPI) {
 		if (!baseBranch) {
 			confirmBody = `Could not determine the base branch — git state will be left untouched. This will delete all workflow sessions; ${archiveNote}.`;
 		} else if (currentBranch === branch) {
-			confirmBody = `This will discard all uncommitted changes on \`${branch}\`, switch to \`${baseBranch}\`, delete \`${branch}\` locally and on origin, and remove all workflow sessions; ${archiveNote}.`;
+			confirmBody = branchCreatedByWorkflow
+				? `This will discard all uncommitted changes on \`${branch}\`, switch to \`${baseBranch}\`, delete \`${branch}\` locally and on origin, and remove all workflow sessions; ${archiveNote}.`
+				: `This will discard all uncommitted changes on \`${branch}\` and switch to \`${baseBranch}\`. The branch \`${branch}\` is kept locally and on origin (adopted — not created by the workflow). It removes all workflow sessions; ${archiveNote}.`;
 		} else {
 			const currentLabel = currentBranch === "" ? "detached HEAD" : currentBranch;
-			confirmBody = `This will delete feature branch \`${branch}\` locally and on origin; you stay on \`${currentLabel}\`. It removes all workflow sessions; ${archiveNote}.`;
+			confirmBody = branchCreatedByWorkflow
+				? `This will delete feature branch \`${branch}\` locally and on origin; you stay on \`${currentLabel}\`. It removes all workflow sessions; ${archiveNote}.`
+				: `The feature branch \`${branch}\` is kept locally and on origin (adopted — not created by the workflow); you stay on \`${currentLabel}\`. It removes all workflow sessions; ${archiveNote}.`;
 		}
 		const confirmed = await ctx.ui.confirm(confirmTitle, confirmBody);
 		if (!confirmed) return;
@@ -1263,10 +1326,14 @@ export default function workflowOrchestrator(pi: ExtensionAPI) {
 
 		// (a) Remote branch deletion runs first (mirrors /done's order): if a
 		// later step degrades into the warn-and-proceed path, a re-run or
-		// manual cleanup is idempotent.
+		// manual cleanup is idempotent. Adopted branches are never deleted —
+		// a hard veto; the plan's Delete remote branch is not consulted for
+		// them (it was authored for created-branch cleanup semantics).
 		let remoteOutcome: string;
 		let gitIncomplete = false;
-		if (!deleteRemote) {
+		if (!branchCreatedByWorkflow) {
+			remoteOutcome = "kept (adopted — not created by the workflow)";
+		} else if (!deleteRemote) {
 			remoteOutcome = "kept per plan (Delete remote branch: false)";
 			ctx.ui.notify(`The plan declares Delete remote branch: false — the remote branch ${branch} is intentionally kept on origin.`, "info");
 		} else {
@@ -1309,11 +1376,16 @@ export default function workflowOrchestrator(pi: ExtensionAPI) {
 		}
 
 		// (c) Local branch deletion. Skipped when the checkout failed: the
-		// feature branch is still checked out and cannot be deleted. A branch
-		// that is already gone counts as success (deleteLocalBranch).
+		// feature branch is still checked out and cannot be deleted. Also
+		// skipped for adopted branches — same ownership principle as (a): a
+		// two-second manual `git branch -D` when truly wanted beats silent
+		// destruction of a pre-existing branch. A branch that is already gone
+		// counts as success (deleteLocalBranch).
 		let localOutcome = "deleted";
 		if (checkoutFailed) {
 			localOutcome = `kept — still checked out (could not switch to ${baseBranch})`;
+		} else if (!branchCreatedByWorkflow) {
+			localOutcome = "kept (adopted — not created by the workflow)";
 		} else {
 			const del = deleteLocalBranch(cwd, branch);
 			if (!del.ok) {
@@ -1346,9 +1418,9 @@ export default function workflowOrchestrator(pi: ExtensionAPI) {
 		pi.registerCommand(name, {
 			description:
 				name === "done"
-					? "Workflow teardown — delete remote/local feature branch, remove workflow sessions, and archive the workflow artifacts after /ship"
+					? "Workflow teardown — clean up what the workflow created, remove workflow sessions, and archive the workflow artifacts after /ship"
 					: name === "abandon"
-						? "Workflow abandon — abort from any step: discard uncommitted changes on the feature branch, delete it locally and on origin, remove workflow sessions, and archive the workflow artifacts"
+						? "Workflow abandon — abort from any step: discard uncommitted changes on the feature branch, clean up what the workflow created, remove workflow sessions, and archive the workflow artifacts"
 						: `Workflow step "${name}" — orchestrates the step session (model/effort, state machine)`,
 			handler: async (args, ctx) => {
 				if (name === "done") {

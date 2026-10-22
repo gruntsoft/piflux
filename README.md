@@ -24,7 +24,9 @@ The workflow provides a set of commands that are expected to be used in order:
 
 ### 1. `/start <branch-name>`
 
-Creates a new branch for the workflow. The workflow ends with this branch being merged back into the base branch or abandoned.
+Creates a new branch for the workflow. If a local branch of that name already exists, the session asks whether to adopt it as the working branch (no branch is created; the base branch is then requested explicitly and must differ from the adopted branch) or to pick a different name. A name that exists only on origin is refused — a locally created branch shadowing a remote branch is a trap for the later teardown. Otherwise a new branch is created as before.
+
+The start artifact records ownership in a `Branch created by workflow: true|false` metadata line. The workflow only cleans up branches it created: when it adopted an existing branch, `/done` and `/abandon` keep the branch — both locally and on origin — regardless of the plan's `Delete remote branch` setting. The workflow ends with the branch being merged back into the base branch or abandoned.
 
 ### 2. `/plan <description>`
 
@@ -63,11 +65,13 @@ Commits with a user-approved message, and squashes the code changes back to the 
 
 ### 8. `/done`
 
-Finishes the workflow by deleting the workflow branch, removing the workflow sessions, and archiving the workflow artifacts to `~/.pi/agent/piflux/history/<ENCODED_REPOSITORY>/done/<BRANCH_SLUG>/`. Can only be executed after `/ship`, and presumes that git state is the same as it was on the previous `/ship` call.
+Finishes the workflow by deleting the workflow branch, removing the workflow sessions, and archiving the workflow artifacts to `~/.pi/agent/piflux/history/<ENCODED_REPOSITORY>/done/<BRANCH_SLUG>/`. The branch is deleted locally and on origin (per the plan's `Delete remote branch`) only when the workflow created it; an adopted branch is kept. Can only be executed after `/ship`, and presumes that git state is the same as it was on the previous `/ship` call.
 
 ### 9. `/abandon [reason]`
 
 Drops an unfinished workflow by restoring the git state to how it was prior to the workflow, removing the workflow sessions, and archiving the workflow artifacts to `~/.pi/agent/piflux/history/<ENCODED_REPOSITORY>/abandoned/<BRANCH_SLUG>/`. More aggressive than `/done`, and can be used at any time during an active workflow to signal that the work should be thrown away. An optional free-text reason (_e.g._: `/abandon plan not covering legacy settings`) is recorded within the archive.
+
+The uncommitted work on the feature branch is always discarded, but the branch itself is deleted locally and on origin only when the workflow created it — an adopted branch is kept in both places.
 
 ### Meta workflow commands
 
