@@ -13,7 +13,7 @@ git branch --show-current
 
 Read the plan file at `$WORKFLOW_DIR/<branch>/plan.md`. If it doesn't exist, note this as a limitation and continue — you can still review on code merits alone.
 
-The plan file is **read-only**. Never modify it. If the plan is wrong, incomplete, or inconsistent with what you find, raise it with the user — they'll decide whether to proceed, adjust course, or return to planning.
+The plan file is **read-only**. Never modify it. If the plan is incomplete or inconsistent with what you find, raise it with the user — they'll decide whether to proceed, adjust course, or return to planning. The exception is a plan-vs-ground-truth conflict: those are raised as findings in Phase 2, escalating only when the false premise invalidates the plan's intent.
 
 Read the code file at `$WORKFLOW_DIR/<branch>/code.md`. If it doesn't exist, stop: "No code file found for branch `<branch>`. Run `/code` or `/icode` first." It tells you which files to examine and stage, explains any intentionally skipped findings, and lists plan deviations — triaged in Phase 2.
 
@@ -43,10 +43,10 @@ Work through every finding in the previous review file:
   - If the explanation is missing or unacceptable, carry the finding forward as open with a note clarifying why the skip doesn't stand.
   - If the call is close, ask the user — don't decide alone.
 
-The plan is a map, not a railroad — deviations happen for valid technical reasons. When an unchecked item relates to a plan deviation, apply the same triage as `/review`: documented with sound justification → move to Won't Fix; undocumented or unsound → carry forward unchecked with a note; close call → ask the user. Never suggest changing the plan — the resolution paths are the iteration flow (/icode → /ireview) or human escalation.
+The plan is a map, not a railroad — deviations happen for valid technical reasons. When an unchecked item relates to a plan deviation, apply the same triage as the initial review (Accept / Flag / Escalate; plan-vs-ground-truth inconsistencies raise a finding — escalate only if the premise invalidates the plan's intent): documented with sound justification → move to Won't Fix; undocumented or unsound → carry forward unchecked with a note; close call → ask the user. Never suggest changing the plan — the resolution paths are the iteration flow (/icode → /ireview) or human escalation.
 - **Won't Fix items**: carry them forward as-is, unchanged — the review file is a complete record.
 
-Then review the new changes with fresh eyes across the five dimensions — Correctness, Suitability, Readability, Performance, Test Coverage — using the same standards as `/review`. Add any new findings. Always compare against the plan when available.
+Then review the new changes with fresh eyes across the five dimensions — Correctness, Suitability, Readability, Performance, Test Coverage — using the same standards as the initial review in this session: Correctness is judged against ground truth (external documentation and API contracts, plus the codebase itself), Suitability against the plan's intent — the plan is authoritative for intent, not for facts; verify facts against their sources. Add any new findings.
 
 ## Phase 3: Write Review
 
@@ -60,7 +60,7 @@ Create `$WORKFLOW_DIR/<branch>/` if it doesn't exist, then overwrite `$WORKFLOW_
 - [ ] <specific finding with file, line number, and reasoning>
 
 ## Warnings
-<!-- undocumented or unsound plan deviations, fragility, maintainability concerns — should fix -->
+<!-- undocumented or unsound plan deviations, fragility, maintainability concerns, plan inconsistencies against ground truth — should fix -->
 - [ ] <specific finding with file, line number, and reasoning>
 
 ## Suggestions
@@ -79,7 +79,7 @@ Create `$WORKFLOW_DIR/<branch>/` if it doesn't exist, then overwrite `$WORKFLOW_
 <!-- 1-2 sentences overall assessment -->
 ```
 
-Rank findings as in `/review`: Critical (broken or unsafe), Warning (meaningful problem — undocumented or unsound plan deviation, fragility, maintainability concerns), Suggestion (could be better). Be specific in every finding: reference exact files, line numbers, and relevant plan sections. Use `- [ ]` checkboxes for actionable findings so they can be tracked across iterations.
+Rank findings: Critical (broken or unsafe), Warning (meaningful problem — undocumented or unsound plan deviation, fragility, maintainability concerns, plan inconsistencies against ground truth), Suggestion (could be better). Be specific in every finding: reference exact files, line numbers, and relevant plan sections. Use `- [ ]` checkboxes for actionable findings so they can be tracked across iterations.
 
 After writing, stage the files listed in the code file's Files changed section — never `git add .`, and never anything outside that list:
 

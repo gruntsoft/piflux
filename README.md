@@ -24,7 +24,7 @@ The workflow provides a set of commands that are expected to be used in order:
 
 ### 1. `/start <branch-name>`
 
-Creates a new branch for the workflow. The workflow ends with this branch being merged back into the base branch or abandoned.
+Creates a new branch for the workflow (or adopts an existing local branch if one exists with the same name). The workflow ends with this branch being merged back into the base branch or abandoned.
 
 ### 2. `/plan <description>`
 
@@ -39,9 +39,9 @@ Creates a new coding session for the workflow. The coding session reads the plan
 ### 4. `/review`
 
 Creates a new reviewing session for the workflow. The reviewing session takes as input the planning artifact, the coding report, and the code changes retrieved from `git` in order to review the code changes based on the following criteria:
-- Correctness: Whether the code does what it is supposed to do.
-- Suitability: How well the code fits the plan it is meant to implement.
-- Maintainability: Whether the code is well-structured for the codebase and easy to maintain.
+- Correctness: Whether the code is right; judged against language, platform, libraries, and the codebase itself.
+- Suitability: Whether the code follows the plan's intent; its requirements, design decisions, and the right level of abstraction.
+- Readability: Whether the code is well-structured for the codebase, consistent with its conventions, and easy to maintain.
 - Performance: Whether the code performs well. But, unless otherwise specified, performance should not take precedence over the first three criteria.
 - Test Coverage: Evaluates how well the code is tested if a test suite is available and if changes can be reasonably tested.
 
@@ -63,11 +63,11 @@ Commits with a user-approved message, and squashes the code changes back to the 
 
 ### 8. `/done`
 
-Finishes the workflow by cleaning up workflow artifacts, workflow sessions, and the workflow branch. Can only be executed after `/ship`, and presumes that git state is the same as it was on the previous `/ship` call.
+Finishes the workflow by removing the workflow sessions and archiving the workflow artifacts to `~/.pi/agent/piflux/history/<ENCODED_REPOSITORY>/done/<BRANCH_SLUG>/`. The branch is deleted only when the workflow created it. Can only be executed after `/ship`, and presumes that git state is the same as it was on the previous `/ship` call.
 
-### 9. `/abandon`
+### 9. `/abandon [reason]`
 
-Drops an unfinished workflow by restoring the git state to how it was prior to the workflow, and by removing the underlying artifacts and sessions that are used to manage it. Slightly more aggressive than `/done`, and can be used at any time during an active workflow to signal that the work should be thrown away.
+Drops an unfinished workflow by restoring the git state to how it was prior to the workflow, removing the workflow sessions, and archiving the workflow artifacts to `~/.pi/agent/piflux/history/<ENCODED_REPOSITORY>/abandoned/<BRANCH_SLUG>/`. More aggressive than `/done`, and can be used at any time during an active workflow to signal that the work should be thrown away. An optional free-text reason (_e.g._: `/abandon plan not covering legacy settings`) is recorded within the archive.
 
 ### Meta workflow commands
 
@@ -82,6 +82,10 @@ Prints the current workflow state, including current step and valid next command
 Here the user can view the work in progress. Can be used while a step is currently running without impacting its execution. The plan artifact, coding and review reports; those can be consulted if the user needs to intervene, or if adjustments must be made.
 
 The viewer is read-only and in-app; there is no need to open workflow artifacts in external editors, and there is no chance of accidental edits that may affect implementation.
+
+### `/piflux history`
+
+Browse the archives of historical workflows (`/done` and `/abandon`), stored under `~/.pi/agent/piflux/history/<ENCODED_REPOSITORY>/`. Like `/piflux view`, it is read-only and in-app. It needs no active workflow, so it can be used mid-workflow or with none running. 
 
 ### `/piflux settings`
 

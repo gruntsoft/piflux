@@ -8,9 +8,15 @@
  * the repo — no .gitignore entry, no git-status clutter, no second workflow
  * root when pi starts in a subdirectory.
  *
+ * Torn-down workflows are archived, not destroyed: `/done` and `/abandon`
+ * move the branch's artifact dir to the history root
+ * `~/.pi/agent/piflux/history/--<encoded-cwd>--/<outcome>/<branch-slug>/`
+ * (outcome `done` or `abandoned`, branch name slugified for the filesystem).
+ *
  * This module exists because `view.ts` must not import from `index.ts`
  * (deps injection), so the shared path helpers live in a third module both
- * import.
+ * import. It holds only the pure/string helpers — the fs-dependent collision
+ * scanning for archive slugs lives in `index.ts` where the fs calls live.
  */
 import { readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
@@ -63,6 +69,28 @@ export function encodeSessionDirName(cwd: string): string {
 /** Repo-level workflow root for a cwd: `<agentDir>/<pkg>/workflows/--<encoded-cwd>--`. */
 export function workflowRootFor(cwd: string): string {
 	return join(getAgentDir(), PACKAGE_CONFIG_DIR, "workflows", encodeSessionDirName(cwd));
+}
+
+/** Repo-level history root for a cwd: `<agentDir>/<pkg>/history/--<encoded-cwd>--`. */
+export function historyRootFor(cwd: string): string {
+	return join(getAgentDir(), PACKAGE_CONFIG_DIR, "history", encodeSessionDirName(cwd));
+}
+
+/**
+ * Filesystem-safe branch slug for archive dir names: path-hostile characters
+ * (`/`, `\`, `:`, `.`, whitespace) map to `-`, then leading/trailing `-` are
+ * trimmed (dots map to `-` first, so `..`-style names collapse to dashes and
+ * an empty result falls back to `"branch"`). Dots are mapped — not preserved
+ * — so an archive dir name can only ever contain a `.` as the `.n` collision
+ * suffix (see the archive step in `index.ts`). Pure — the collision counter
+ * needs fs access and stays with the archive step in `index.ts`.
+ */
+export function slugifyBranch(branch: string): string {
+	const slug = branch
+		.replace(/[/\\:.\s]/g, "-")
+		.replace(/^-+/, "")
+		.replace(/-+$/, "");
+	return slug || "branch";
 }
 
 /** The workflow state file for a cwd — sits at the repo level, next to the branch dirs. */

@@ -149,4 +149,4 @@ git checkout <branch>
 
 Tell the human: the merge commit is on `<base>` and was pushed to origin. They can inspect it with `git show <base>` or `git log origin/<base>`. If something is wrong, they can fix it on `<base>` and push — then run `/done` to finish the workflow. Note any changes the human chose to leave unstaged/untracked — they're still in the working tree.
 
-`/done` is now the full cleanup: it deletes the remote feature branch (per the plan), deletes the local feature branch, switches to the base branch, and removes all workflow sessions and artifacts — no separate `/cleanup` step exists anymore.
+`/done` is now the full cleanup: it deletes the remote feature branch (per the plan) and the local feature branch — unless the workflow only adopted the branch (start.md `Branch created by workflow: false`), which is kept in both places — switches to the base branch, and removes all workflow sessions and artifacts — no separate `/cleanup` step exists anymore.

@@ -29,11 +29,12 @@
  *   source of truth for the current step, branch, and session paths. All
  *   reads and writes are synchronous. `/done` marks it `step: "done"` before
  *   its git teardown begins (a failed or interrupted `/done` leaves a retryable
- *   state) and removes it — together with the workflow's sessions and
- *   artifacts — on success. `/abandon` (any step) removes it too.
+ *   state) and removes it — together with the workflow's sessions — on
+ *   success; the artifacts are archived to the history dir, not destroyed
+ *   (see performCleanup). `/abandon` (any step) does the same.
  */
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmdirSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -46,6 +47,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Container, Key, matchesKey, SelectList, Text } from "@earendil-works/pi-tui";
 import { createWorkflowViewer, isViewTarget, viewArgumentCompletions } from "./view.ts";
+import { createHistoryViewer, historyArgumentCompletions, isHistoryOutcome } from "./history.ts";
 
 type StepName = "start" | "plan" | "code" | "review" | "icode" | "ireview" | "ship" | "done" | "abandon";
 type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
@@ -71,7 +73,7 @@ const SETTINGS_FILE_NAME = "settings.json";
 
 // Workflow artifacts and state live outside the repo, under the global
 // config dir (see paths.ts) — nothing is written inside the repository.
-import { PACKAGE_CONFIG_DIR, artifactPath, stateFilePath, workflowRootFor } from "./paths.ts";
+import { PACKAGE_CONFIG_DIR, artifactPath, historyRootFor, slugifyBranch, stateFilePath, workflowRootFor } from "./paths.ts";
 
 /** Valid next commands per state. "done" is a retryable terminal step: a failed or interrupted `/done` can be re-run. */
 const NEXT_COMMANDS: Record<StepName, string[]> = {
@@ -123,6 +125,42 @@ interface WorkflowState {
 	branch: string;
 	sessions: Partial<Record<StepName, string>>;
 }
+
+/** What the teardown records about the archive, written into the archived dir as workflow.json. */
+type ArchiveInfo = {
+	outcome: "done" | "abandoned";
+	baseBranch: string | null;
+	/** HEAD of the base branch at /done time (best-effort); null for abandoned runs. */
+	commit: string | null;
+	/** Free-text reason, /abandon only — omitted when absent. */
+	reason?: string;
+};
+
+/** performCleanup's outcome: whether the state file (the new-workflow gate) is gone, whether every tracked session file was removed, and where the artifacts were archived. */
+type CleanupResult = { stateFileRemoved: boolean; sessionsRemoved: boolean; archivePath: string | null };
+
+/**
+ * Summary wording for the workflow-sessions line: "deleted" only when every
+ * tracked session file was removed (or was already gone) — a warned unlink
+ * leaves files behind and must not claim a blanket deletion.
+ */
+export const sessionsOutcomeLine = (result: CleanupResult): string =>
+	result.sessionsRemoved ? "deleted" : "incomplete — see the warnings above";
+
+/**
+ * Summary wording for the workflow-artifacts line. The state file is the
+ * new-workflow gate, so its failure leads the line ("cleanup incomplete")
+ * even when the archive move itself succeeded — the archive path is still
+ * reported so the user can find the archived artifacts.
+ */
+export const artifactsOutcomeLine = (result: CleanupResult): string => {
+	if (!result.stateFileRemoved) {
+		return result.archivePath
+			? `cleanup incomplete — see the warnings above; artifacts archived to ${result.archivePath}`
+			: "cleanup incomplete — see the warnings above";
+	}
+	return result.archivePath ? `archived to ${result.archivePath}` : "archive incomplete — see the warnings above";
+};
 
 // ------------------------------------------------------------------
 // Prompt template helpers (pure, module-level — unit-testable)
@@ -279,13 +317,18 @@ export function unsetStepInFile(file: string, step: StepName): boolean {
 // ------------------------------------------------------------------
 
 /**
- * The plan metadata `/done` acts on. Absent lines parse to `null` — the
- * callers decide the fallback (`Delete remote branch` absent → delete;
- * `Tag release` absent → no tag).
+ * The plan metadata `/done` acts on — plus the start artifact's ownership
+ * flag, parsed with the same parser (`parsePlanMetadata` is
+ * section-agnostic, so start.md's Metadata block reads the same way).
+ * Absent lines parse to `null` — the callers decide the fallback
+ * (`Delete remote branch` absent → delete; `Tag release` absent → no tag;
+ * `Branch created by workflow` absent → created, so artifacts written
+ * before the field existed keep the destructive default).
  */
 export interface PlanMetadata {
 	baseBranch: string | null;
 	deleteRemoteBranch: boolean | null;
+	branchCreatedByWorkflow: boolean | null;
 	newVersion: string | null;
 	tagRelease: boolean | null;
 }
@@ -304,6 +347,7 @@ export function parsePlanMetadata(content: string): PlanMetadata {
 	return {
 		baseBranch: line(/^\s*-\s*Base branch:\s*(\S+)[ \t]*$/m),
 		deleteRemoteBranch: bool(/^\s*-\s*Delete remote branch:\s*(true|false)[ \t]*$/m),
+		branchCreatedByWorkflow: bool(/^\s*-\s*Branch created by workflow:\s*(true|false)[ \t]*$/m),
 		newVersion: line(/^\s*-\s*New version:\s*(\S+)[ \t]*$/m),
 		tagRelease: bool(/^\s*-\s*Tag release:\s*(true|false)[ \t]*$/m),
 	};
@@ -772,41 +816,80 @@ export default function workflowOrchestrator(pi: ExtensionAPI) {
 	});
 
 	// ------------------------------------------------------------------
-	// /done and /abandon → destroy sessions and artifacts
+	// /done and /abandon → delete sessions, archive artifacts, remove state
 	// ------------------------------------------------------------------
 
 	/**
-	 * Deletes everything the workflow owns: its session files (from
-	 * `state.sessions`), the branch's artifact files, and the state file.
-	 * Best-effort throughout — ENOENT (already gone) is silently ignored,
-	 * anything else is reported as a warning without aborting.
-	 * @returns true when the cleanup fully completed (state file removed or
-	 * already absent), false when it failed and the state file survives.
+	 * Tears down everything the workflow owns: deletes its session files
+	 * (from `state.sessions`), archives the branch's artifact dir into the
+	 * history tree, and removes the state file. Best-effort throughout —
+	 * ENOENT (already gone) is silently ignored, anything else is reported
+	 * as a warning without aborting.
+	 *
+	 * The archive is a move, not a copy: the workflow.json metadata is
+	 * written into the branch dir *before* the rename, so one same-filesystem
+	 * `renameSync` carries artifacts and metadata over atomically —
+	 * `workflows/` stays the single source of truth for the active workflow.
+	 * The target is `<historyRoot>/<outcome>/<branch-slug>/`, first free name
+	 * winning (`<slug>`, `<slug>.1`, …). A missing branch dir (a previous run
+	 * already archived it) skips silently so a retryable /done or re-run
+	 * /abandon completes; any other archive failure warns and teardown
+	 * continues — the state file removal below gates new workflows and must
+	 * not be blocked.
+	 * @returns the CleanupResult the summaries report on.
 	 */
-	function performCleanup(state: WorkflowState, ctx: ExtensionCommandContext): boolean {
+	function performCleanup(state: WorkflowState, ctx: ExtensionCommandContext, archive: ArchiveInfo): CleanupResult {
 		const cwd = ctx.cwd;
 
-		// Session files. Dedupe: /icode and /ireview reuse the code/review paths.
+		// Session files. Dedupe: /icode and /ireview reuse the code/review
+		// paths. A warned unlink (file left behind) flips sessionsRemoved so
+		// the summary cannot claim a blanket deletion.
+		let sessionsRemoved = true;
 		for (const sessionFile of new Set(Object.values(state.sessions).filter((f): f is string => typeof f === "string"))) {
 			try {
 				unlinkSync(sessionFile);
 			} catch (err) {
 				if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+					sessionsRemoved = false;
 					ctx.ui.notify(`Could not delete session file "${sessionFile}" — ${err instanceof Error ? err.message : String(err)}`, "warning");
 				}
 			}
 		}
 
-		// The branch's artifact dir — all of this branch's artifacts
-		// (start/plan/code/review) live in one directory, so a single
-		// recursive delete removes them all. force: true makes rmSync
-		// ENOENT-silent; anything else it throws is reported.
+		// The branch's artifact dir — archive it (see the doc comment above);
+		// only an existing dir is moved, an already-archived one skips.
 		const workflowRoot = workflowRootFor(cwd);
 		const branchDir = join(workflowRoot, state.branch);
-		try {
-			rmSync(branchDir, { recursive: true, force: true });
-		} catch (err) {
-			ctx.ui.notify(`Could not remove workflow directory "${branchDir}" — ${err instanceof Error ? err.message : String(err)}`, "warning");
+		let archivePath: string | null = null;
+		if (existsSync(branchDir)) {
+			try {
+				const metadata: Record<string, string | null> = {
+					outcome: archive.outcome,
+					branch: state.branch,
+					baseBranch: archive.baseBranch,
+					finalStep: state.step,
+					archivedAt: new Date().toISOString(),
+					commit: archive.commit,
+				};
+				if (archive.reason) metadata.reason = archive.reason;
+				writeFileSync(join(branchDir, "workflow.json"), `${JSON.stringify(metadata, null, "\t")}\n`);
+				const outcomeRoot = join(historyRootFor(cwd), archive.outcome);
+				// First free `<slug>`, `<slug>.1`, `<slug>.2`, … wins. The `.n`
+				// suffix is unambiguous: slugifyBranch maps `.` to `-`, so a dot
+				// in an archive name can only come from the counter (a manually
+				// created `foo.1` dir collides naturally and counts).
+				const slug = slugifyBranch(state.branch);
+				let target = join(outcomeRoot, slug);
+				for (let i = 1; existsSync(target); i++) target = join(outcomeRoot, `${slug}.${i}`);
+				mkdirSync(outcomeRoot, { recursive: true });
+				renameSync(branchDir, target);
+				archivePath = target;
+			} catch (err) {
+				ctx.ui.notify(
+					`Could not archive the workflow artifacts of branch "${state.branch}" — ${err instanceof Error ? err.message : String(err)}. The artifacts remain at ${branchDir}; teardown continues.`,
+					"warning",
+				);
+			}
 		}
 
 		// The repo-level dir, when it is now empty. rmdir only removes a
@@ -841,15 +924,14 @@ export default function workflowOrchestrator(pi: ExtensionAPI) {
 		if (stateFileRemoved) {
 			ctx.ui.notify("Workflow cleaned up.", "info");
 		}
-		return stateFileRemoved;
+		return { stateFileRemoved, sessionsRemoved, archivePath };
 	}
 
 	/**
 	 * Leaves the current session (it is one of the tracked workflow sessions,
 	 * so its file cannot be unlinked while in use) and runs the cleanup from
-	 * the fresh "Clean slate" session. Returns true when the cleanup fully
-	 * completed (state file removed), false when it failed, and null when the
-	 * session creation was cancelled (cleanup never ran).
+	 * the fresh "Clean slate" session. Returns the cleanup result, or null
+	 * when the session creation was cancelled (cleanup never ran).
 	 *
 	 * `after` runs inside `withSession` after the cleanup, with the fresh
 	 * session ctx and the cleanup result — the documented pattern for work
@@ -860,17 +942,18 @@ export default function workflowOrchestrator(pi: ExtensionAPI) {
 		state: WorkflowState,
 		ctx: ExtensionCommandContext,
 		command: string,
-		after?: (sctx: ExtensionCommandContext, cleanupResult: boolean) => void | Promise<void>,
-	): Promise<boolean | null> {
+		archive: ArchiveInfo,
+		after?: (sctx: ExtensionCommandContext, cleanupResult: CleanupResult) => void | Promise<void>,
+	): Promise<CleanupResult | null> {
 		const parentSession = ctx.sessionManager.getSessionFile();
-		let cleanupResult = false;
+		let cleanupResult: CleanupResult = { stateFileRemoved: false, sessionsRemoved: false, archivePath: null };
 		const result = await ctx.newSession({
 			parentSession,
 			setup: async (sm) => {
 				sm.appendSessionInfo("Clean slate");
 			},
 			withSession: async (sctx) => {
-				cleanupResult = performCleanup(state, sctx);
+				cleanupResult = performCleanup(state, sctx, archive);
 				if (after) await after(sctx, cleanupResult);
 			},
 		});
@@ -884,15 +967,21 @@ export default function workflowOrchestrator(pi: ExtensionAPI) {
 	/**
 	 * /done is pure extension teardown — no agent session. In order:
 	 * validate the transition (ship or done state), read the plan metadata
-	 * (Base branch required; Delete remote branch defaults to true), mark the
-	 * state `step: "done"` so a failed run is retryable, then the git work:
-	 * remote branch deletion (plan-gated, best-effort — absent is detected
-	 * via `git ls-remote` exit code 2 and skipped silently), checkout of the
-	 * base branch (failure aborts with the state intact), local branch
-	 * deletion with `-D` (already-gone counts as success). On success the
+	 * (Base branch required; Delete remote branch defaults to true) plus the
+	 * start artifact's ownership flag (`Branch created by workflow`, absent →
+	 * created — a missing/unreadable start artifact warns and keeps that
+	 * default), mark the state `step: "done"` so a failed run is retryable,
+	 * then the git work: remote branch deletion (plan-gated, best-effort —
+	 * absent is detected via `git ls-remote` exit code 2 and skipped
+	 * silently; skipped entirely for adopted branches — the workflow only
+	 * cleans up what it created), checkout of the base branch (failure
+	 * aborts with the state intact), local branch deletion with `-D`
+	 * (already-gone counts as success; skipped for adopted branches, which
+	 * also removes the fail-closed abort path for them). On success the
 	 * clean-slate teardown (switchToCleanSlate → performCleanup) removes
-	 * sessions and artifacts, then the final summary is reported — so the
-	 * summary reflects what actually happened, including a failed cleanup.
+	 * the sessions, archives the artifacts, and removes the state file, then
+	 * the final summary is reported — so the summary reflects what actually
+	 * happened, including a failed cleanup.
 	 *
 	 * The summary is emitted from the replacement "Clean slate" session (via
 	 * the switchToCleanSlate `after` callback): everything it reports — the
@@ -934,13 +1023,40 @@ export default function workflowOrchestrator(pi: ExtensionAPI) {
 		const baseBranch = metadata.baseBranch;
 		const deleteRemote = metadata.deleteRemoteBranch ?? true;
 
+		// Branch ownership comes from the start artifact — the only record of
+		// whether /start created the branch. Absent flag → created (true):
+		// artifacts written before the field existed keep today's delete
+		// behavior — the plan's explicit backward-compat rule. The residual
+		// risk this accepts: pre-change /start sessions could adopt an
+		// existing branch via improvisation (the near-loss accident that
+		// motivated ownership tracking), so a legacy artifact may record an
+		// adopted branch, and this default cannot detect it. A
+		// missing/unreadable start artifact is unexpected (start always
+		// writes one) — warn and keep the default.
+		const startPath = artifactPath(cwd, branch, "start");
+		let branchCreatedByWorkflow = true;
+		if (!existsSync(startPath)) {
+			ctx.ui.notify(`The start artifact at ${startPath} is missing — treating the branch as created by this workflow.`, "warning");
+		} else {
+			try {
+				branchCreatedByWorkflow = parsePlanMetadata(readFileSync(startPath, "utf-8")).branchCreatedByWorkflow ?? true;
+			} catch {
+				ctx.ui.notify(`Could not read the start artifact at ${startPath} — treating the branch as created by this workflow.`, "warning");
+			}
+		}
+
 		// Mark the workflow "done" before any git work: a failed or
 		// interrupted /done leaves a retryable state.
 		writeState(cwd, { step: "done", branch, sessions: state!.sessions });
 
-		// (a) Remote branch deletion is plan-gated.
+		// (a) Remote branch deletion is plan-gated — and ownership-gated:
+		// adopted branches are never deleted, the plan is not consulted for
+		// them (its Delete remote branch field was authored for /done's
+		// post-merge cleanup of created branches).
 		let remoteOutcome: string;
-		if (!deleteRemote) {
+		if (!branchCreatedByWorkflow) {
+			remoteOutcome = "kept (adopted — not created by the workflow)";
+		} else if (!deleteRemote) {
 			remoteOutcome = "kept per plan (Delete remote branch: false)";
 			ctx.ui.notify(`The plan declares Delete remote branch: false — the remote branch ${branch} is intentionally kept on origin.`, "info");
 		} else {
@@ -960,17 +1076,33 @@ export default function workflowOrchestrator(pi: ExtensionAPI) {
 			return;
 		}
 
-		// (c) Delete the local feature branch. A branch that is already gone
-		// (git's "not found" error, exit 1) is the ENOENT-equivalent — a
-		// previous run deleted it — and counts as success. Anything else
-		// aborts with the state intact.
-		const del = deleteLocalBranch(cwd, branch);
-		if (!del.ok) {
-			ctx.ui.notify(
-				`Could not delete the local branch ${branch} — ${del.stderr}. /done aborted; nothing was destroyed and the workflow state is intact — /done can be re-run.`,
-				"error",
-			);
-			return;
+		// (b2) HEAD of the base branch, recorded in the archived workflow.json
+		// (best-effort: null on git failure). Known limitation: commits made on
+		// base after /ship make this HEAD, not the merge commit — an acceptable
+		// proxy; nothing machine-readable records ship's commit otherwise.
+		const head = gitCommand(cwd, ["rev-parse", "HEAD"]);
+		const commit = head.ok ? head.output : null;
+
+		// (c) Delete the local feature branch — unless the branch was only
+		// adopted (same ownership principle as (a): a two-second manual
+		// `git branch -D` when truly wanted beats silent destruction of a
+		// pre-existing branch). A branch that is already gone (git's "not
+		// found" error, exit 1) is the ENOENT-equivalent — a previous run
+		// deleted it — and counts as success. Anything else aborts with the
+		// state intact.
+		let localOutcome: string;
+		if (!branchCreatedByWorkflow) {
+			localOutcome = "kept (adopted — not created by the workflow)";
+		} else {
+			const del = deleteLocalBranch(cwd, branch);
+			if (!del.ok) {
+				ctx.ui.notify(
+					`Could not delete the local branch ${branch} — ${del.stderr}. /done aborted; nothing was destroyed and the workflow state is intact — /done can be re-run.`,
+					"error",
+				);
+				return;
+			}
+			localOutcome = "deleted";
 		}
 
 		// (f) Success: the tag outcome is reported, not performed — /ship creates
@@ -999,15 +1131,16 @@ export default function workflowOrchestrator(pi: ExtensionAPI) {
 		// plain strings/ids, explicitly safe to capture across it. Only the
 		// cleanup-dependent outcomes are derived in the callback (from the
 		// cleanup result) and in the cancellation branch below.
-		const summary = (artifactsOutcome: string, sessionOutcome: string) =>
+		const summary = (sessionsOutcome: string, artifactsOutcome: string, sessionOutcome: string) =>
 			[
 				`Workflow \"${branch}\" torn down.`,
 				`- Remote branch: ${remoteOutcome}`,
-				`- Local branch ${branch}: deleted`,
+				`- Local branch ${branch}: ${localOutcome}`,
 				`- Current branch: ${baseBranch}`,
 				`- Working tree: ${treeState}`,
 				`- Release tag: ${tagOutcome}`,
-				`- Workflow sessions and artifacts: ${artifactsOutcome}`,
+				`- Workflow sessions: ${sessionsOutcome}`,
+				`- Workflow artifacts: ${artifactsOutcome}`,
 				`- Session: ${sessionOutcome}`,
 			].join("\n");
 
@@ -1016,14 +1149,17 @@ export default function workflowOrchestrator(pi: ExtensionAPI) {
 		// cleanup is reflected in the artifacts line, not contradicted by it).
 		// The summary is emitted from the replacement session via `after`;
 		// the old ctx is stale once the replacement happened.
-		const cleanupResult = await switchToCleanSlate(state!, ctx, "done", (sctx, result) => {
-			const artifactsOutcome = result ? "removed" : "cleanup incomplete — see the warnings above";
-			sctx.ui.notify(summary(artifactsOutcome, "Clean slate"), "info");
+		// The state object the cleanup receives must be the marked one (step
+		// "done", written above), not the stale pre-git read — finalStep in
+		// the archived workflow.json records state.step at teardown.
+		const teardownState: WorkflowState = { ...state!, step: "done" };
+		const cleanupResult = await switchToCleanSlate(teardownState, ctx, "done", { outcome: "done", baseBranch, commit }, (sctx, result) => {
+			sctx.ui.notify(summary(sessionsOutcomeLine(result), artifactsOutcomeLine(result), "Clean slate"), "info");
 		});
 		if (cleanupResult === null) {
 			// Cancellation path: no replacement occurred, so the old ctx is
 			// still valid here.
-			ctx.ui.notify(summary("cleanup cancelled (session creation cancelled)", "not created (creation cancelled)"), "info");
+			ctx.ui.notify(summary("cleanup cancelled (session creation cancelled)", "cleanup cancelled (session creation cancelled)", "not created (creation cancelled)"), "info");
 		}
 	}
 
@@ -1039,30 +1175,42 @@ export default function workflowOrchestrator(pi: ExtensionAPI) {
 	 *
 	 * Branch behavior matrix (authoritative):
 	 * 1. on feature + base exists: reset --hard + clean -fd → checkout base →
-	 *    delete feature → remote best-effort → artifact cleanup
+	 *    delete feature → remote best-effort → artifact archive
 	 * 2. on base + feature exists: tree untouched → delete feature → remote
-	 *    best-effort → artifact cleanup; stay on base
-	 * 3. on base + no feature: remote best-effort → artifact cleanup
+	 *    best-effort → artifact archive; stay on base
+	 * 3. on base + no feature: remote best-effort → artifact archive
 	 * 4. on feature + base missing: checkout fails → warn with git's stderr,
 	 *    skip the local delete (the checked-out branch cannot be deleted),
-	 *    proceed with artifact cleanup; summary reports git cleanup incomplete
+	 *    proceed with artifact archive; summary reports git cleanup incomplete
 	 * 5. on other + feature exists: tree + current branch untouched → delete
-	 *    feature → remote best-effort → artifact cleanup; stay put
-	 * 6. on other + no feature: remote best-effort → artifact cleanup
+	 *    feature → remote best-effort → artifact archive; stay put
+	 * 6. on other + no feature: remote best-effort → artifact archive
+	 *
+	 * Adopted branches (start.md `Branch created by workflow: false`, absent
+	 * → created) replace both deletion steps with keeps in every case — the
+	 * workflow cleans up only what it created, and the plan's `Delete remote
+	 * branch` never overrides adoption. The tree discard, the checkout, the
+	 * teardown, and the archive are identical for adopted branches.
 	 *
 	 * The base branch comes from the start artifact's `Base branch` metadata
 	 * (start.md always exists post-/start). Missing/unreadable/metadata-less
-	 * → warn, artifact cleanup only, no git ops at all.
+	 * → warn, artifact archive only, no git ops at all.
 	 */
 	async function runAbandon(args: string, ctx: ExtensionCommandContext): Promise<void> {
 		const cwd = ctx.cwd;
+		// Argument parsing up front: --force gates the corrupt-state path, the
+		// remaining tokens join into the free-text reason recorded in the
+		// archived workflow.json — parsed from args, never a prompt, so bare
+		// /abandon stays fully programmatic (and --force parsing is unaffected).
+		const tokens = args.split(/\s+/);
+		const force = tokens.includes("--force");
+		const reason = tokens.filter((t) => t !== "--force").join(" ");
 		const state = readState(cwd, ctx);
 		if (!state) {
 			// --force covers the one case plain /abandon cannot: a corrupt or
 			// unreadable state file. Sessions and artifacts can't be located
 			// without a readable state (and must not be guessed at), so only
 			// the state file itself is removed.
-			const force = args.split(/\s+/).includes("--force");
 			if (force && existsSync(stateFilePath(cwd))) {
 				const confirmed = await ctx.ui.confirm(
 					"Delete corrupt workflow state file?",
@@ -1084,14 +1232,20 @@ export default function workflowOrchestrator(pi: ExtensionAPI) {
 		}
 		const branch = state.branch;
 
-		// Base branch from the start artifact — /abandon is valid from any
-		// step, including before /plan exists, so the plan is never consulted
-		// for it. Reuse the regex-based parsePlanMetadata: section-agnostic,
-		// so start.md's own Metadata block parses the same way as plan.md's.
+		// Base branch and branch ownership from the start artifact — /abandon
+		// is valid from any step, including before /plan exists, so the plan
+		// is never consulted for either. Reuse the regex-based
+		// parsePlanMetadata: section-agnostic, so start.md's own Metadata
+		// block parses the same way as plan.md's. Absent ownership flag →
+		// created (true): artifacts written before the field existed keep
+		// today's delete behavior.
 		const startPath = artifactPath(cwd, branch, "start");
 		let baseBranch: string | null = null;
+		let branchCreatedByWorkflow = true;
 		try {
-			baseBranch = parsePlanMetadata(readFileSync(startPath, "utf-8")).baseBranch;
+			const startMeta = parsePlanMetadata(readFileSync(startPath, "utf-8"));
+			baseBranch = startMeta.baseBranch;
+			branchCreatedByWorkflow = startMeta.branchCreatedByWorkflow ?? true;
 		} catch {
 			baseBranch = null;
 		}
@@ -1113,16 +1267,25 @@ export default function workflowOrchestrator(pi: ExtensionAPI) {
 			}
 		}
 
+		// The archive record: artifacts move to the abandoned/ subtree with the
+		// reason (omitted when empty) and no commit — the feature work is
+		// discarded, never merged, so there is no merge commit to record.
+		const archive: ArchiveInfo = { outcome: "abandoned", baseBranch, commit: null, ...(reason ? { reason } : {}) };
+		const archiveNote = `the workflow artifacts are archived (not destroyed) under ${join(historyRootFor(cwd), "abandoned")}`;
+
 		const confirmTitle = `Abandon workflow on branch ${branch}?`;
 		let confirmBody: string;
 		if (!baseBranch) {
-			confirmBody =
-				"Could not determine the base branch — git state will be left untouched. This will delete all workflow sessions and artifacts.";
+			confirmBody = `Could not determine the base branch — git state will be left untouched. This will delete all workflow sessions; ${archiveNote}.`;
 		} else if (currentBranch === branch) {
-			confirmBody = `This will discard all uncommitted changes on \`${branch}\`, switch to \`${baseBranch}\`, delete \`${branch}\` locally and on origin, and remove all workflow sessions and artifacts.`;
+			confirmBody = branchCreatedByWorkflow
+				? `This will discard all uncommitted changes on \`${branch}\`, switch to \`${baseBranch}\`, delete \`${branch}\` locally and on origin, and remove all workflow sessions; ${archiveNote}.`
+				: `This will discard all uncommitted changes on \`${branch}\` and switch to \`${baseBranch}\`. The branch \`${branch}\` is kept locally and on origin (adopted — not created by the workflow). It removes all workflow sessions; ${archiveNote}.`;
 		} else {
 			const currentLabel = currentBranch === "" ? "detached HEAD" : currentBranch;
-			confirmBody = `This will delete feature branch \`${branch}\` locally and on origin; you stay on \`${currentLabel}\`. It removes all workflow sessions and artifacts.`;
+			confirmBody = branchCreatedByWorkflow
+				? `This will delete feature branch \`${branch}\` locally and on origin; you stay on \`${currentLabel}\`. It removes all workflow sessions; ${archiveNote}.`
+				: `The feature branch \`${branch}\` is kept locally and on origin (adopted — not created by the workflow); you stay on \`${currentLabel}\`. It removes all workflow sessions; ${archiveNote}.`;
 		}
 		const confirmed = await ctx.ui.confirm(confirmTitle, confirmBody);
 		if (!confirmed) return;
@@ -1132,18 +1295,21 @@ export default function workflowOrchestrator(pi: ExtensionAPI) {
 		// outcomes are derived in the `after` callback from the cleanup result
 		// (and in the cancellation branch), mirroring /done's summary pattern.
 		const finishWithSummary = async (staticLines: string[]) => {
-			const summary = (artifactsOutcome: string, sessionOutcome: string) =>
-				[`Workflow \"${branch}\" abandoned.`, ...staticLines, `- Workflow sessions and artifacts: ${artifactsOutcome}`, `- Session: ${sessionOutcome}`].join(
-					"\n",
-				);
-			const cleanupResult = await switchToCleanSlate(state, ctx, "abandon", (sctx, result) => {
-				const artifactsOutcome = result ? "removed" : "cleanup incomplete — see the warnings above";
-				sctx.ui.notify(summary(artifactsOutcome, "Clean slate"), "info");
+			const summary = (sessionsOutcome: string, artifactsOutcome: string, sessionOutcome: string) =>
+				[
+					`Workflow \"${branch}\" abandoned.`,
+					...staticLines,
+					`- Workflow sessions: ${sessionsOutcome}`,
+					`- Workflow artifacts: ${artifactsOutcome}`,
+					`- Session: ${sessionOutcome}`,
+				].join("\n");
+			const cleanupResult = await switchToCleanSlate(state, ctx, "abandon", archive, (sctx, result) => {
+				sctx.ui.notify(summary(sessionsOutcomeLine(result), artifactsOutcomeLine(result), "Clean slate"), "info");
 			});
 			if (cleanupResult === null) {
 				// Cancellation path: no replacement occurred, so the old ctx is
 				// still valid here.
-				ctx.ui.notify(summary("cleanup cancelled (session creation cancelled)", "not created (creation cancelled)"), "info");
+				ctx.ui.notify(summary("cleanup cancelled (session creation cancelled)", "cleanup cancelled (session creation cancelled)", "not created (creation cancelled)"), "info");
 			}
 		};
 
@@ -1160,10 +1326,14 @@ export default function workflowOrchestrator(pi: ExtensionAPI) {
 
 		// (a) Remote branch deletion runs first (mirrors /done's order): if a
 		// later step degrades into the warn-and-proceed path, a re-run or
-		// manual cleanup is idempotent.
+		// manual cleanup is idempotent. Adopted branches are never deleted —
+		// a hard veto; the plan's Delete remote branch is not consulted for
+		// them (it was authored for created-branch cleanup semantics).
 		let remoteOutcome: string;
 		let gitIncomplete = false;
-		if (!deleteRemote) {
+		if (!branchCreatedByWorkflow) {
+			remoteOutcome = "kept (adopted — not created by the workflow)";
+		} else if (!deleteRemote) {
 			remoteOutcome = "kept per plan (Delete remote branch: false)";
 			ctx.ui.notify(`The plan declares Delete remote branch: false — the remote branch ${branch} is intentionally kept on origin.`, "info");
 		} else {
@@ -1206,11 +1376,16 @@ export default function workflowOrchestrator(pi: ExtensionAPI) {
 		}
 
 		// (c) Local branch deletion. Skipped when the checkout failed: the
-		// feature branch is still checked out and cannot be deleted. A branch
-		// that is already gone counts as success (deleteLocalBranch).
+		// feature branch is still checked out and cannot be deleted. Also
+		// skipped for adopted branches — same ownership principle as (a): a
+		// two-second manual `git branch -D` when truly wanted beats silent
+		// destruction of a pre-existing branch. A branch that is already gone
+		// counts as success (deleteLocalBranch).
 		let localOutcome = "deleted";
 		if (checkoutFailed) {
 			localOutcome = `kept — still checked out (could not switch to ${baseBranch})`;
+		} else if (!branchCreatedByWorkflow) {
+			localOutcome = "kept (adopted — not created by the workflow)";
 		} else {
 			const del = deleteLocalBranch(cwd, branch);
 			if (!del.ok) {
@@ -1243,9 +1418,9 @@ export default function workflowOrchestrator(pi: ExtensionAPI) {
 		pi.registerCommand(name, {
 			description:
 				name === "done"
-					? "Workflow teardown — delete remote/local feature branch and all workflow sessions and artifacts after /ship"
+					? "Workflow teardown — clean up what the workflow created, remove workflow sessions, and archive the workflow artifacts after /ship"
 					: name === "abandon"
-						? "Workflow abandon — abort from any step: discard uncommitted changes on the feature branch, delete it locally and on origin, and remove all workflow sessions and artifacts"
+						? "Workflow abandon — abort from any step: discard uncommitted changes on the feature branch, clean up what the workflow created, remove workflow sessions, and archive the workflow artifacts"
 						: `Workflow step "${name}" — orchestrates the step session (model/effort, state machine)`,
 			handler: async (args, ctx) => {
 				if (name === "done") {
@@ -1265,8 +1440,13 @@ export default function workflowOrchestrator(pi: ExtensionAPI) {
 	// module only exports the factory plus pure helpers.
 	const workflowViewer = createWorkflowViewer({ readState, nextCommands: NEXT_COMMANDS });
 
+	// /piflux history — read-only archived-workflow viewer (history.ts), also
+	// deps-free: it reads only the filesystem plus ctx.cwd, so no active
+	// workflow needs to exist for it to work.
+	const historyViewer = createHistoryViewer();
+
 	pi.registerCommand("piflux", {
-		description: "Workflow orchestrator — state, settings, view",
+		description: "Workflow orchestrator — state, settings, view, history",
 		getArgumentCompletions: (prefix: string) => {
 			// Second-token completion for `/piflux view <TAB>` first. The
 			// completion callback has no ctx/cwd, so the state is read from
@@ -1276,8 +1456,12 @@ export default function workflowOrchestrator(pi: ExtensionAPI) {
 			// returns null on any doubt.
 			const viewItems = viewArgumentCompletions(prefix, readState(process.cwd()), process.cwd());
 			if (viewItems) return viewItems;
-			// First-token filter. The "view" value carries a trailing space:
-			// pi's argument completion replaces only the argument text (no
+			// Second-token completion for `/piflux history <TAB>`: the two
+			// outcome tokens (no active workflow needed, so no state read).
+			const historyItems = historyArgumentCompletions(prefix, process.cwd());
+			if (historyItems) return historyItems;
+			// First-token filter. The "view"/"history" values carry a trailing
+			// space: pi's argument completion replaces only the argument text (no
 			// space is appended), and the editor never opens the autocomplete
 			// popup on a bare space nor via TAB after one — so without it,
 			// accepting "view" strands the line at "/piflux view" and the
@@ -1288,6 +1472,7 @@ export default function workflowOrchestrator(pi: ExtensionAPI) {
 				{ value: "state", label: "state" },
 				{ value: "settings", label: "settings" },
 				{ value: "view ", label: "view" },
+				{ value: "history ", label: "history" },
 			];
 			return items.filter((i) => i.value.startsWith(prefix));
 		},
@@ -1318,8 +1503,21 @@ export default function workflowOrchestrator(pi: ExtensionAPI) {
 					}
 					ctx.ui.notify("Usage: /piflux view [state|start|plan|code|review]", "warning");
 					return;
+				case "history":
+					// No active workflow required: history browsing works
+					// mid-workflow or with none running.
+					if (tokens.length === 1) {
+						await historyViewer(ctx);
+						return;
+					}
+					if (tokens.length === 2 && isHistoryOutcome(tokens[1])) {
+						await historyViewer(ctx, tokens[1]);
+						return;
+					}
+					ctx.ui.notify("Usage: /piflux history [done|abandoned]", "warning");
+					return;
 			}
-			ctx.ui.notify("Usage: /piflux [state|settings|view]", "warning");
+			ctx.ui.notify("Usage: /piflux [state|settings|view|history]", "warning");
 		},
 	});
 
@@ -1340,7 +1538,7 @@ export default function workflowOrchestrator(pi: ExtensionAPI) {
 				`Branch: ${state.branch}`,
 				`Next: ${NEXT_COMMANDS[state.step].join(", ")}`,
 				`Sessions: ${sessionSteps}`,
-				`Run /abandon to destroy the workflow, discard uncommitted changes, and return to the base branch.`,
+				`Run /abandon to abandon the workflow (artifacts are archived, not destroyed), discard uncommitted changes, and return to the base branch.`,
 			].join("\n"),
 			"info",
 		);
